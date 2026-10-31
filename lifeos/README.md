@@ -17,22 +17,22 @@ Everything is stored **only on your phone** (IndexedDB). Nothing leaves the devi
 
 ## 0. How this copy is deployed (already set up)
 
-- **Code:** private GitHub repo <https://github.com/shewskis/lifeos> (this folder is the checkout; the app lives in `lifeos/`).
-- **Hosting:** Netlify site **boisterous-sorbet-ad513a** → <https://boisterous-sorbet-ad513a.netlify.app>, linked to that repo. `netlify.toml` publishes `lifeos/` with no build step.
-- **Publishing a change:** commit and push to `main`. Netlify builds in about 20 seconds and the installed app shows "Update ready → Reload" on next open.
+- **Code:** GitHub repo <https://github.com/shewskis/lifeos>. This folder is the checkout; the app lives in `lifeos/`.
+- **Hosting:** GitHub Pages at **<https://shewskis.github.io/lifeos/>**. The workflow in `.github/workflows/pages.yml` uploads the `lifeos/` folder on every push to `main`; nothing to build. GitHub Pages on a free account requires the repo to be public, which is fine: the code holds no secrets, and everything you log stays on your phone.
+- **Phone:** open that URL in Chrome on Android once → ⋮ → **Install app**. From then on the installed app updates itself.
+
+**Publishing a change** from this folder:
 
 ```bash
 git add -A && git commit -m "Describe the change" && git push
 ```
 
-Before pushing a code change, bump `VERSION` in `lifeos/sw.js` (and `LIFEOS_VERSION` in `lifeos/index.html`) so phones drop the cached files.
+About a minute later the new version is live. The installed app shows "Update ready → Reload" the next time it is opened (or on the second open, if it was already running). Before pushing a code change, bump `VERSION` in `lifeos/sw.js` and `LIFEOS_VERSION` in `lifeos/index.html` so phones drop the cached files.
 
-**Site protection:** Netlify turned on "team login" protection for this site (`sso_login`). While it is on, only people logged in to your Netlify team can open the URL, so your phone gets a login page. Turn it off once in the dashboard: *Site configuration → Access & security → Site protection → None (public)*. The app itself keeps all data on the device, so a public URL exposes only the code.
-
-Check a deploy or trigger one by hand from this folder (the Netlify CLI is linked to the site):
+Check a deploy:
 
 ```bash
-npx netlify-cli deploy:list
+gh run list --workflow pages.yml --limit 3
 ```
 
 ---
