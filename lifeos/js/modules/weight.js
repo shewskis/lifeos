@@ -1,5 +1,5 @@
 // weight.js — daily weigh-ins, 7-day trend, goal line & BMI.
-// Store: weights { id, date, kg (always kg), bodyFat (number|null), note ('' ok) }
+// Store: weights { id, date, time ('HH:MM' when weighed, '' on old entries), kg (always kg), bodyFat (number|null), note ('' ok) }
 // Settings: 'weight:goal' (kg|null), 'weight:height' (cm|null), 'weight:range' (chart range).
 import { h, clear, dates, fmt, icon, toast, sheet, form, formSheet, confirm, segmented, empty, card, listItem, fab, stat, lineChart } from '../ui.js';
 
@@ -29,6 +29,19 @@ function fmtDelta(kgDelta, unit, withUnit = true) {
 }
 function signed(n) { return (n > 0 ? '+' : '') + n.toFixed(1); }
 
+// ---------- time of weigh-in ----------
+const HM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+const isHM = (t) => typeof t === 'string' && HM_RE.test(t);
+function nowHM() { const d = new Date(); return dates.pad(d.getHours()) + ':' + dates.pad(d.getMinutes()); }
+/** '07:05' → '7:05 AM' / '07:05' in the device's locale; '' when there is no time. */
+function timeLabel(t) {
+  if (!isHM(t)) return '';
+  const [hh, mm] = t.split(':').map(Number);
+  return new Date(2000, 0, 1, hh, mm).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+}
+/** 'Today · 7:05 AM' (date label plus the time when the entry has one). */
+function whenLabel(e) { const t = timeLabel(e.time); return t ? `${dates.label(e.date)} · ${t}` : dates.label(e.date); }
+
 // ---------- data ----------
 /** Make an old/partial record safe to use, or null if unusable. */
 function normalize(r) {
@@ -36,7 +49,7 @@ function normalize(r) {
   const kg = Number(r.kg ?? r.weight);
   if (!Number.isFinite(kg) || kg <= 0) return null;
   const bf = r.bodyFat === null || r.bodyFat === undefined || r.bodyFat === '' ? null : Number(r.bodyFat);
-  return { ...r, kg, bodyFat: Number.isFinite(bf) && bf > 0 ? bf : null, note: typeof r.note === 'string' ? r.note : '' };
+  return { ...r, kg, time: isHM(r.time) ? r.time : '', bodyFat: Number.isFinite(bf) && bf > 0 ? bf : null, note: typeof r.note === 'string' ? r.note : '' };
 }
 /** All entries, ascending by date. */
 async function loadAll(ctx) {
@@ -97,19 +110,22 @@ async function saveEntry(ctx, data, original) {
   const sameDate = (await ctx.db.where(STORE, 'date', data.date)).filter((e) => e.id !== original?.id);
   if (sameDate.length) {
     const target = sameDate[0], prev = normalize(target) || { bodyFat: null, note: '' };
-    // Only overwrite what the user filled in: an empty body-fat / note keeps that day's existing values.
-    const saved = await ctx.db.put(STORE, { ...target, kg: data.kg, bodyFat: data.bodyFat ?? prev.bodyFat, note: data.note || prev.note });
+    // Only overwrite what the user filled in: an empty body-fat / note / time keeps that day's existing values.
+    const saved = await ctx.db.put(STORE, { ...target, kg: data.kg, time: data.time || prev.time || '', bodyFat: data.bodyFat ?? prev.bodyFat, note: data.note || prev.note });
     if (original?.id) await ctx.db.delete(STORE, original.id);
     for (const dupe of sameDate.slice(1)) await ctx.db.delete(STORE, dupe.id);
     return { rec: saved, merged: true };
   }
-  const saved = await ctx.db.put(STORE, { ...(original || {}), date: data.date, kg: data.kg, bodyFat: data.bodyFat, note: data.note });
+  const saved = await ctx.db.put(STORE, { ...(original || {}), date: data.date, time: data.time || '', kg: data.kg, bodyFat: data.bodyFat, note: data.note });
   return { rec: saved, merged: false };
 }
 
 /** Add (original = null) or edit a weigh-in. Weight input has a −0.1 / +0.1 stepper for sleepy mornings. */
 async function openEntry(ctx, original = null) {
   const unit = unitOf(ctx);
+  // A fresh "Log weight" stamps the current time. That includes re-logging today when today already has a weigh-in
+  // (you just weighed again); only opening an existing entry from the list keeps the time it was taken.
+  let stampNow = !original;
   if (!original) {
     // One entry per date: logging when today already has a weigh-in edits it (prefilled body fat / note, Delete shown).
     const existing = (await ctx.db.where(STORE, 'date', dates.today())).map(normalize).filter(Boolean);
@@ -119,6 +135,7 @@ async function openEntry(ctx, original = null) {
   if (lastKg == null) { const all = await loadAll(ctx); lastKg = all.length ? all[all.length - 1].kg : null; }
   const f = form([
     { name: 'date', label: 'Date', type: 'date', required: true, max: dates.today(), value: original?.date || dates.today() },
+    { name: 'time', label: 'Time', type: 'time', value: stampNow ? nowHM() : (normalize(original)?.time || '') },
     { name: 'weight', label: `Weight (${unit})`, type: 'number', required: true, autofocus: true, step: 0.1, min: 1, placeholder: unit === 'lb' ? 'e.g. 180.4' : 'e.g. 82.4', value: lastKg != null ? round1(toDisplay(lastKg, unit)) : '' },
     { name: 'bodyFat', label: 'Body fat %', type: 'number', step: 0.1, min: 1, max: 80, placeholder: 'optional', value: original?.bodyFat ?? '' },
     { name: 'note', label: 'Note', type: 'text', placeholder: 'optional — e.g. after travel', value: original?.note || '' },
@@ -145,8 +162,12 @@ async function openEntry(ctx, original = null) {
   // The field is prefilled with the last weight: select it on focus so typing replaces it instead of appending digits.
   wIn.addEventListener('focus', () => setTimeout(() => { try { wIn.select(); } catch { /* not all input types support select() */ } }, 0));
 
+  // Date and time side by side: the time is already filled in, so it costs no extra tap.
+  const dIn = f.fields.date.input, tIn = f.fields.time.input;
+  const dRow = dIn.closest('.field'), tRow = tIn.closest('.field');
+  if (dRow && tRow) { const pair = h('div.grid-2'); dRow.replaceWith(pair); pair.append(dRow, tRow); }
+
   // Moving the date onto a day that already has an entry: prefill its body fat / note so saving does not wipe them.
-  const dIn = f.fields.date.input;
   dIn.addEventListener('change', async () => {
     const d = dIn.value;
     if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || d === original?.date) return;
@@ -167,7 +188,8 @@ async function openEntry(ctx, original = null) {
     if (v.date > dates.today()) { dIn.classList.add('invalid'); toast("You can't log a future weigh-in"); return false; }
     dIn.classList.remove('invalid');
     const bf = v.bodyFat == null ? null : Number(v.bodyFat);
-    const data = { date: v.date, kg: round2(kg), bodyFat: Number.isFinite(bf) && bf > 0 ? round1(bf) : null, note: String(v.note || '').trim() };
+    const time = isHM(String(v.time || '').slice(0, 5)) ? String(v.time).slice(0, 5) : '';
+    const data = { date: v.date, time, kg: round2(kg), bodyFat: Number.isFinite(bf) && bf > 0 ? round1(bf) : null, note: String(v.note || '').trim() };
     const { merged } = await saveEntry(ctx, data, original);
     toast(merged ? `Updated ${dates.label(data.date)} · ${fmtW(data.kg, unit)}` : original ? 'Entry updated' : `Logged ${fmtW(data.kg, unit)}`);
     return true;
@@ -254,14 +276,14 @@ function actionDate(d) {
 }
 /** Compact one-line description of an entry for the model, in the user's unit, with id. */
 function entryLine(e, unit) {
-  const parts = [`${e.date}: ${fmtW(e.kg, unit)}`];
+  const parts = [`${e.date}${e.time ? ' ' + e.time : ''}: ${fmtW(e.kg, unit)}`];
   if (e.bodyFat != null) parts.push(`${fmt.num(e.bodyFat, 1)}% fat`);
   if (e.note) parts.push(e.note.length > 80 ? e.note.slice(0, 77) + '…' : e.note);
   return `${parts.join(' · ')} (id ${e.id})`;
 }
 /** How the UI names a weigh-in in confirmation previews: '82.4 kg from Yesterday · 18.0% fat · "after travel"'. */
 function entryLabel(e, unit) {
-  const parts = [`${fmtW(e.kg, unit)} from ${dates.label(e.date)}`];
+  const parts = [`${fmtW(e.kg, unit)} from ${whenLabel(e)}`];
   if (e.bodyFat != null) parts.push(`${fmt.num(e.bodyFat, 1)}% fat`);
   if (e.note) parts.push(`"${e.note.length > 40 ? e.note.slice(0, 37) + '…' : e.note}"`);
   return parts.join(' · ');
@@ -322,7 +344,7 @@ export default {
           h('button.link', { style: LINK_STYLE, onclick: () => setGoal(ctx, draw) }, goal != null ? `Goal ${fmtW(goal, unit)}` : 'Set goal')),
         h('div.big-number', numW(latest.kg, unit), h('small', unit)),
         h('div.small.muted', { style: { marginTop: '6px' } },
-          dates.label(latest.date), avg7.n >= 2 ? ` · 7-day avg ${fmtW(avg7.avg, unit)}` : ''),
+          whenLabel(latest), avg7.n >= 2 ? ` · 7-day avg ${fmtW(avg7.avg, unit)}` : ''),
         d7 != null || d30 != null
           ? h('div.chips.mt', changeChip(d7, 'vs 7 days', latest.kg, goal, unit), changeChip(d30, 'vs 30 days', latest.kg, goal, unit))
           : h('div.small.muted.mt', 'Keep logging — changes vs 7 and 30 days show up here.')));
@@ -360,7 +382,7 @@ export default {
       shown.forEach((e, i) => {
         const prev = entries[entries.length - 2 - i];
         const delta = prev ? e.kg - prev.kg : null;
-        const sub = [dates.label(e.date)];
+        const sub = [whenLabel(e)];
         if (e.bodyFat != null) sub.push(`${fmt.num(e.bodyFat, 1)}% fat`);
         if (e.note) sub.push(e.note);
         list.append(listItem({
@@ -401,7 +423,8 @@ export default {
       return card({ class: 'tappable', onclick: open },
         title('Details'),
         h('div.row.between',
-          h('div', { style: { fontWeight: 700, fontSize: '18px' } }, `Today ${fmtW(latest.kg, unit)}`),
+          h('div', h('div', { style: { fontWeight: 700, fontSize: '18px' } }, `Today ${fmtW(latest.kg, unit)}`),
+            latest.time ? h('div.small.muted', `at ${timeLabel(latest.time)}`) : null),
           d7 != null
             ? h('span.chip', { class: dir }, Math.abs(d7) >= 0.05 ? icon(d7 < 0 ? 'arrowDown' : 'arrowUp', 14) : null, `${fmtDelta(d7, unit, false)} this week`)
             : h('span.chip', 'first week')));
@@ -427,7 +450,7 @@ export default {
     const lines = [
       '## Weight (all values in kg)',
       `- Entries: ${entries.length} (${first.date} → ${latest.date})`,
-      `- Latest: ${k(latest.kg)} on ${latest.date} (${dates.ago(latest.date)}); 7-day average ${k(avg7.avg)} over ${avg7.n} day${avg7.n === 1 ? '' : 's'}`,
+      `- Latest: ${k(latest.kg)} on ${latest.date}${latest.time ? ' at ' + latest.time : ''} (${dates.ago(latest.date)}); 7-day average ${k(avg7.avg)} over ${avg7.n} day${avg7.n === 1 ? '' : 's'}`,
       `- First: ${k(first.kg)} on ${first.date}; total change ${signed(latest.kg - first.kg)} kg`,
       `- Lowest: ${k(lowest.kg)} (${lowest.date}); highest: ${k(highest.kg)} (${highest.date})`,
       goal != null ? `- Goal: ${k(goal)} (${signed(goal - latest.kg)} kg to go)` : '- Goal: not set',
@@ -448,9 +471,17 @@ export default {
       lines.push('', `Weekly averages since ${since} (week starting Monday):`);
       for (const [w, a] of [...weeks.entries()].slice(-26)) lines.push(`- ${w}: ${(a.sum / a.n).toFixed(1)} kg (${a.n} day${a.n === 1 ? '' : 's'})`);
     }
+    const timed = entries.slice(-30).filter((e) => e.time);
+    if (timed.length >= 3) {
+      // Weigh-in time matters for comparability (morning vs evening can differ by 1 kg+).
+      const mins = timed.map((e) => { const [hh, mm] = e.time.split(':').map(Number); return hh * 60 + mm; });
+      const avgMin = Math.round(mins.reduce((a, b) => a + b, 0) / mins.length);
+      const spread = Math.max(...mins) - Math.min(...mins);
+      lines.push(`- Usual weigh-in time: ~${dates.pad(Math.floor(avgMin / 60))}:${dates.pad(avgMin % 60)} (spread ${Math.floor(spread / 60)}h${dates.pad(spread % 60)}m over ${timed.length} timed entries)`);
+    }
     lines.push('', 'Last 30 entries:');
     for (const e of entries.slice(-30).reverse()) {
-      lines.push(`${e.date}: ${e.kg.toFixed(1)} kg${e.bodyFat != null ? ` · ${e.bodyFat.toFixed(1)}% fat` : ''}${e.note ? ` · ${e.note.slice(0, 300)}` : ''}`);
+      lines.push(`${e.date}${e.time ? ' ' + e.time : ''}: ${e.kg.toFixed(1)} kg${e.bodyFat != null ? ` · ${e.bodyFat.toFixed(1)}% fat` : ''}${e.note ? ` · ${e.note.slice(0, 300)}` : ''}`);
     }
     return lines.filter((l) => l !== null).join('\n');
   },
@@ -462,6 +493,7 @@ export default {
       params: {
         weight: { type: 'number', description: "Body weight in the user's unit (kg or lb)" },
         date: { type: 'string', description: 'Date YYYY-MM-DD (default today; cannot be in the future)' },
+        time: { type: 'string', description: 'Time of the weigh-in HH:MM 24h. Omit it when the user is weighing in now: today\'s entries get the current time automatically. Give it when they mention one ("this morning at 7").' },
         body_fat: { type: 'number', description: 'Optional body fat percentage (1–80)' },
         note: { type: 'string', description: "Optional short note, e.g. 'after travel'" },
       },
@@ -496,9 +528,14 @@ export default {
           bodyFat = round1(bf);
         }
         const note = args.note == null ? '' : String(args.note).trim().slice(0, 300);
-        const { rec, merged } = await saveEntry(ctx, { date, kg: round2(kg), bodyFat, note }, null);
+        let time = '';
+        if (args.time !== undefined && args.time !== null && args.time !== '') {
+          if (!isHM(String(args.time))) throw new Error('time must be HH:MM (24h), e.g. 07:15');
+          time = String(args.time);
+        } else if (date === dates.today()) time = nowHM(); // weighing in now
+        const { rec, merged } = await saveEntry(ctx, { date, time, kg: round2(kg), bodyFat, note }, null);
         const saved = normalize(rec) || { ...rec, kg: round2(kg), bodyFat, note };
-        return `${merged ? 'Updated' : 'Logged'} ${fmtW(saved.kg, unit)} on ${saved.date}${saved.bodyFat != null ? ` · ${fmt.num(saved.bodyFat, 1)}% fat` : ''}${saved.note ? ` · ${saved.note}` : ''} (id ${saved.id})`;
+        return `${merged ? 'Updated' : 'Logged'} ${fmtW(saved.kg, unit)} on ${saved.date}${saved.time ? ' at ' + saved.time : ''}${saved.bodyFat != null ? ` · ${fmt.num(saved.bodyFat, 1)}% fat` : ''}${saved.note ? ` · ${saved.note}` : ''} (id ${saved.id})`;
       },
     },
     {
