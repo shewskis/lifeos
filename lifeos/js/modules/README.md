@@ -63,7 +63,7 @@ ctx.app       — the app object; ctx.app.render() forces a full re-render (rare
 - `sheet({title, content, actions:[{label, primary, danger, onClick}], onClose, full})` → `{el, body, close}`.
 - `confirm(message, {okLabel})` → Promise<boolean>. `prompt(message, {title, value, multiline})` → Promise<string|null>.
 - `form(fields, values)` → `{el, values(), set(), validate(), focus()}` — field types: text, number, date, time, textarea, select, toggle, tags, segment, range, hidden. Fields: `{name,label,type,placeholder,required,options,min,max,step,value,hint,autofocus,rows,labels}`.
-- `formSheet({title, fields, values, saveLabel, onDelete, extra})` → Promise<values|null>. **The standard way to add/edit a record.** Pass `onDelete` when editing so the sheet shows a Delete button.
+- `formSheet({title, fields, values, saveLabel, onDelete, extra, extraTop})` → Promise<values|null>. **The standard way to add/edit a record.** Pass `onDelete` when editing so the sheet shows a Delete button. `extraTop` renders a node above the fields (reachable without scrolling, e.g. a "Complete" action), `extra` below them.
 - `segmented(options, active, onChange)` → element with `.setValue(v)`.
 - `empty(text, sub, iconName)`, `card(...children)`, `listItem({title, sub, right, leading, onClick, onLongPress, done})`, `fab(onClick)`, `stat(label, value, sub)`.
 - Charts: `lineChart(points:[{x:'YYYY-MM-DD'|number, y}], {height, color, goal, yMin, yMax, showDots})`, `barList([{label, value, color}], {format})`, `columns([{label,value,color}], {height, format})`, `ring(frac, {size, color, label})`.

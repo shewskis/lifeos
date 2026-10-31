@@ -1,5 +1,5 @@
 // tasks.js — To-dos with due dates, priorities, repeats and goal links.
-import { h, clear, dates, fmt, icon, toast, formSheet, confirm, listItem, empty, card, fab, ring } from '../ui.js';
+import { h, clear, dates, fmt, icon, toast, formSheet, confirm, listItem, empty, card, fab, ring, closeTopSheet } from '../ui.js';
 
 const STORE = 'tasks';
 const PRIORITIES = [{ value: 'high', label: 'High' }, { value: 'med', label: 'Medium' }, { value: 'low', label: 'Low' }];
@@ -178,12 +178,18 @@ async function openSheet(ctx, existing, preset = {}) {
   ];
   if (goalOpts.length > 1) fields.push({ name: 'goalId', label: 'Linked goal', type: 'select', options: goalOpts });
   fields.push({ name: 'notes', label: 'Notes', type: 'textarea', rows: 3, placeholder: 'Details, links, context…' });
+  // Existing task: a Complete button above the form, so finishing a task never requires finding the checkbox.
+  const extra = existing ? h('button.btn.block.mb', { type: 'button', class: cur.done ? '' : 'complete', onclick: async () => {
+    closeTopSheet(); // resolves the sheet with null; the row redraws from the db:change event
+    try { await toggleDone(ctx, cur); } catch (e) { console.error(e); toast('Could not update task'); }
+  } }, icon(cur.done ? 'refresh' : 'check', 18), cur.done ? 'Mark as not done' : 'Complete task') : null;
   const vals = await formSheet({
     title: existing ? 'Edit task' : 'New task',
     fields,
     values: cur,
     saveLabel: existing ? 'Save' : 'Add task',
     onDelete: existing ? async () => { await ctx.db.delete(STORE, existing.id); toast('Task deleted'); } : undefined,
+    extraTop: extra,
   });
   if (!vals) return null;
   const rec = {
@@ -239,12 +245,23 @@ function subLine(t, goals, { showDate = true } = {}) {
   return h('div.row.wrap', { style: { gap: '6px', rowGap: '2px' } }, parts);
 }
 
+/** Explicit "Complete" / "Undo" button on the right of every row (the circle on the left still works too). */
+function completeButton(ctx, t) {
+  return h('button.btn.sm', {
+    type: 'button',
+    class: t.done ? 'ghost' : 'complete',
+    'aria-label': t.done ? 'Mark not done' : 'Complete task',
+    onclick: (e) => { e.stopPropagation(); toggleDone(ctx, t).catch((err) => { console.error(err); toast('Could not update task'); }); },
+  }, icon(t.done ? 'refresh' : 'check', 16), t.done ? 'Undo' : 'Complete');
+}
+
 function taskRow(ctx, t, goals, opts = {}) {
   let lpAt = 0;
   return listItem({
     leading: checkbox(ctx, t),
     title: t.title,
     sub: subLine(t, goals, opts),
+    right: completeButton(ctx, t),
     done: t.done,
     onClick: () => { if (Date.now() - lpAt < 700) return; openSheet(ctx, t).catch(console.error); },
     onLongPress: () => { lpAt = Date.now(); if (!t.done) cyclePriority(ctx, t).catch(console.error); },

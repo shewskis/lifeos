@@ -323,13 +323,14 @@ export function form(fields, values = {}) {
  * Convenience: open a sheet with a form. Resolves with values or null.
  * opts: { title, fields, values, saveLabel, onDelete }
  */
-export function formSheet({ title, fields, values = {}, saveLabel = 'Save', onDelete, extra }) {
+export function formSheet({ title, fields, values = {}, saveLabel = 'Save', onDelete, extra, extraTop }) {
   return new Promise((resolve) => {
     const f = form(fields, values);
     const actions = [];
     if (onDelete) actions.push({ label: 'Delete', danger: true, onClick: async () => { const ok = await confirm('This cannot be undone.'); if (ok) { await onDelete(); resolve(null); return true; } return false; } });
     actions.push({ label: saveLabel, primary: true, onClick: () => { const err = f.validate(); if (err) { toast(err); return false; } resolve(f.values()); } });
-    const s = sheet({ title, content: [f.el, extra || null], actions, onClose: () => resolve(null) });
+    // extraTop renders above the fields (e.g. a primary action that must be reachable without scrolling), extra below.
+    const s = sheet({ title, content: [extraTop || null, f.el, extra || null], actions, onClose: () => resolve(null) });
     f.focus();
     f.el.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.tagName === 'INPUT') { e.preventDefault(); const err = f.validate(); if (err) { toast(err); return; } resolve(f.values()); s.close(); } });
   });
