@@ -1,6 +1,6 @@
 // calendar.js — Events & schedule. Month grid + 30-day agenda, recurring events (expanded in memory),
 // tasks overlay (read-only from the 'tasks' store), Google Calendar hand-off, .ics import/export.
-import { h, clear, dates, fmt, icon, toast, sheet, confirm, form, segmented, empty, card, listItem, fab, pickFile, downloadText } from '../ui.js';
+import { h, clear, dates, fmt, icon, toast, sheet, confirm, form, segmented, empty, card, listItem, fab, pickFile, downloadText, longPress } from '../ui.js';
 
 const STORE = 'events';
 const HORIZON_DAYS = 730; // open-ended recurring events expand at most 2 years ahead of today
@@ -439,7 +439,71 @@ function gridRange(monthKey, weekStart) {
   return { from, to };
 }
 
-async function drawMonth(ctx, body, events) {
+/** Move the visible month by n (±1) and pick a sensible day in it: today when it is in that month, else the 1st. */
+function shiftMonth(n) {
+  const d = dates.parse(state.month);
+  d.setDate(1);
+  d.setMonth(d.getMonth() + n);
+  goMonth(dates.key(d));
+}
+function goMonth(key, selected) {
+  const today = dates.today();
+  state.month = dates.monthStart(key);
+  state.selected = selected || (dates.monthStart(today) === state.month ? today : state.month);
+}
+
+/** Bottom sheet with a year stepper and 12 month buttons. Resolves with 'YYYY-MM-01' or null. */
+function pickMonth() {
+  return new Promise((resolve) => {
+    let year = Number(state.month.slice(0, 4));
+    const thisMonth = dates.monthStart(dates.today());
+    const grid = h('div.cal-months');
+    const yearLabel = h('h3', { style: { margin: '0', flex: '1', textAlign: 'center' } });
+    let chosen = null;
+    const paint = () => {
+      yearLabel.textContent = String(year);
+      clear(grid);
+      for (let m = 0; m < 12; m++) {
+        const key = `${year}-${String(m + 1).padStart(2, '0')}-01`;
+        grid.append(h('button.btn', {
+          type: 'button',
+          class: (key === state.month ? 'primary' : '') + (key === thisMonth ? ' cal-month-now' : ''),
+          onclick: () => { chosen = key; s.close(); },
+        }, dates.parse(key).toLocaleDateString(undefined, { month: 'short' })));
+      }
+    };
+    const s = sheet({
+      title: 'Go to month',
+      content: [
+        h('div.date-nav',
+          h('button.icon-btn', { type: 'button', 'aria-label': 'Previous year', onclick: () => { year--; paint(); } }, icon('back')),
+          yearLabel,
+          h('button.icon-btn', { type: 'button', 'aria-label': 'Next year', onclick: () => { year++; paint(); } }, icon('chevron'))),
+        grid,
+      ],
+      actions: [{ label: 'Today', onClick: () => { chosen = thisMonth; } }],
+      onClose: () => resolve(chosen),
+    });
+    paint();
+  });
+}
+
+/** Horizontal swipe on `el` → fn(+1) for left swipe (next), fn(-1) for right swipe (previous). Vertical scrolling is untouched. */
+function onSwipe(el, fn) {
+  let x0 = null, y0 = null, t0 = 0;
+  el.addEventListener('touchstart', (e) => { if (e.touches.length !== 1) { x0 = null; return; } x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; t0 = Date.now(); }, { passive: true });
+  el.addEventListener('touchend', (e) => {
+    if (x0 === null) return;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - x0, dy = t.clientY - y0;
+    x0 = null;
+    if (Date.now() - t0 > 800 || Math.abs(dx) < 50 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
+    el.dataset.swiped = String(Date.now()); // lets the day buttons ignore the click that ends a swipe
+    fn(dx < 0 ? 1 : -1);
+  });
+}
+
+async function drawMonth(ctx, out, events, redraw) {
   const weekStart = ctx.settings.get('weekStart', 'mon');
   const today = dates.today();
   const { from, to } = gridRange(state.month, weekStart);
@@ -447,55 +511,96 @@ async function drawMonth(ctx, body, events) {
   const tasks = await loadTasks(ctx, from, to);
   const evBy = groupByDate(occ);
   const taskBy = groupByDate(tasks);
+  const thisMonth = dates.monthStart(today);
 
-  const setMonth = (m, sel) => { state.month = dates.monthStart(m); if (sel) state.selected = sel; draw(ctx, body, events); };
-  const shift = (n) => { const d = dates.parse(state.month); d.setMonth(d.getMonth() + n); setMonth(dates.key(d)); };
+  const shift = (n) => { shiftMonth(n); redraw(); };
+  const toToday = () => { goMonth(today, today); redraw(); };
+  const scrollToDay = () => requestAnimationFrame(() => {
+    const el = document.querySelector('.cal-daycard');
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    if (r.top > window.innerHeight - 160) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
 
   const grid = h('div.cal-grid', weekdayHeader(weekStart));
   for (let k = from; k <= to; k = dates.addDays(k, 1)) {
-    const inMonth = k.slice(0, 7) === state.month.slice(0, 7);
-    const nEv = (evBy.get(k) || []).length, nT = (taskBy.get(k) || []).length;
+    const key = k;
+    const inMonth = key.slice(0, 7) === state.month.slice(0, 7);
+    const dayEv = evBy.get(key) || [], nEv = dayEv.length, nT = (taskBy.get(key) || []).length;
     const evDots = Math.min(nEv, nT ? 2 : 3), tDots = Math.min(nT, 3 - evDots);
     const dots = [];
-    for (let i = 0; i < evDots; i++) dots.push(h('span.dot'));
+    for (let i = 0; i < evDots; i++) dots.push(h('span.dot', { style: { background: colorOf(dayEv[i].ev) } }));
     for (let i = 0; i < tDots; i++) dots.push(h('span.dot', { style: { background: 'var(--warn)' } }));
-    grid.append(h('button.cal-day', {
+    let pressedAt = 0;
+    const cell = h('button.cal-day', {
       type: 'button',
-      class: (inMonth ? '' : 'other') + (k === today ? ' today' : '') + (k === state.selected ? ' selected' : ''),
-      'aria-label': dates.label(k, { year: true }) + (nEv ? `, ${nEv} event${nEv === 1 ? '' : 's'}` : '') + (nT ? `, ${nT} task${nT === 1 ? '' : 's'}` : ''),
-      onclick: () => { state.selected = k; if (!inMonth) state.month = dates.monthStart(k); draw(ctx, body, events); },
-    }, h('span', String(Number(k.slice(8)))), dots.length ? h('div.dots', dots) : null));
+      class: (inMonth ? '' : 'other') + (key === today ? ' today' : '') + (key === state.selected ? ' selected' : ''),
+      'aria-label': dates.label(key, { year: true }) + (nEv ? `, ${nEv} event${nEv === 1 ? '' : 's'}` : '') + (nT ? `, ${nT} task${nT === 1 ? '' : 's'}` : ''),
+      'aria-pressed': key === state.selected ? 'true' : 'false',
+      onclick: () => {
+        if (Date.now() - Number(grid.dataset.swiped || 0) < 400) return; // the tap that ended a swipe
+        if (Date.now() - pressedAt < 700) return;                      // the click after a long-press
+        if (key === state.selected) { openAdd(ctx, key); return; }     // second tap on the selected day = add to it
+        state.selected = key;
+        if (!inMonth) state.month = dates.monthStart(key);
+        redraw().then(scrollToDay);
+      },
+    }, h('span', String(Number(key.slice(8)))), dots.length ? h('div.dots', dots) : null);
+    longPress(cell, () => { pressedAt = Date.now(); state.selected = key; if (!inMonth) state.month = dates.monthStart(key); openAdd(ctx, key); redraw(); });
+    grid.append(cell);
   }
+  onSwipe(grid, shift);
 
-  body.append(card(
+  const offToday = state.month !== thisMonth || state.selected !== today;
+  out.append(card(
     h('div.date-nav',
-      h('button.icon-btn', { 'aria-label': 'Previous month', onclick: () => shift(-1) }, icon('back')),
-      h('button.btn.ghost', {
-        type: 'button', 'aria-label': 'Jump to today', title: 'Jump to today',
-        style: { flex: '1', minHeight: '40px', padding: '0 8px', fontSize: '17px', fontWeight: '700', color: 'var(--text)', flexDirection: 'column', gap: '0', lineHeight: '1.15' },
-        onclick: () => setMonth(today, today),
-      }, dates.monthLabel(state.month), state.month !== dates.monthStart(today) ? h('span.small.muted', { style: { fontWeight: '400' } }, 'Tap for today') : null),
-      h('button.icon-btn', { 'aria-label': 'Next month', onclick: () => shift(1) }, icon('chevron'))),
-    grid));
+      h('button.icon-btn', { type: 'button', 'aria-label': 'Previous month', onclick: () => shift(-1) }, icon('back')),
+      h('button.cal-title', {
+        type: 'button', 'aria-label': `${dates.monthLabel(state.month)}, choose another month`,
+        onclick: async () => { const m = await pickMonth(); if (m) { goMonth(m); redraw(); } },
+      }, dates.monthLabel(state.month), h('span.cal-caret', '▾')),
+      offToday ? h('button.btn.sm.ghost.cal-today', { type: 'button', onclick: toToday }, 'Today') : null,
+      h('button.icon-btn', { type: 'button', 'aria-label': 'Next month', onclick: () => shift(1) }, icon('chevron'))),
+    grid,
+    h('div.small.muted.cal-hint', 'Swipe to change month · tap a day to see it, tap again or hold to add')));
 
-  // Day agenda for the selected day
+  // Day panel for the selected day
   const sel = state.selected;
   const dayEv = evBy.get(sel) || [];
   const dayTasks = taskBy.get(sel) || [];
-  const dayCard = card(h('div.card-title',
-    h('h3', dayHeading(sel)),
-    h('button.btn.sm.primary', { onclick: () => openAdd(ctx, sel) }, '+ Add')));
+  const stepDay = (n) => {
+    const k = dates.addDays(sel, n);
+    state.selected = k;
+    state.month = dates.monthStart(k);
+    redraw();
+  };
+  const dayCard = h('div.card.cal-daycard',
+    h('div.card-title',
+      h('div.row', { style: { gap: '2px', minWidth: '0', flex: '1' } },
+        h('button.icon-btn', { type: 'button', 'aria-label': 'Previous day', onclick: () => stepDay(-1) }, icon('back', 20)),
+        (() => {
+          // "Today" on top, the date under it — one line would be cut off at phone width
+          const rel = dates.label(sel);
+          const full = dates.parse(sel).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short', ...(sel.slice(0, 4) !== today.slice(0, 4) ? { year: 'numeric' } : {}) });
+          const isRel = ['Today', 'Yesterday', 'Tomorrow'].includes(rel);
+          return h('div', { style: { minWidth: '0', flex: '1', textAlign: 'center', lineHeight: '1.2' } },
+            h('h3', { style: { margin: '0', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, isRel ? rel : full),
+            isRel ? h('div.small.muted', full) : null);
+        })(),
+        h('button.icon-btn', { type: 'button', 'aria-label': 'Next day', onclick: () => stepDay(1) }, icon('chevron', 20))),
+      h('button.btn.sm.primary', { type: 'button', onclick: () => openAdd(ctx, sel) }, icon('plus', 16), 'Add')));
   if (!dayEv.length && !dayTasks.length) {
-    dayCard.append(h('p.muted.small', { style: { textAlign: 'center', padding: '8px 0 4px' } }, 'Nothing planned. Tap + Add to schedule something.'));
+    dayCard.append(h('p.muted.small', { style: { textAlign: 'center', padding: '8px 0 4px', margin: '0' } }, 'Nothing planned for this day.'));
   } else {
     const list = h('div.list');
     for (const o of dayEv) list.append(eventRow(ctx, o));
     for (const t of dayTasks) list.append(taskRow(ctx, t));
     dayCard.append(list);
   }
-  body.append(dayCard);
+  onSwipe(dayCard, stepDay);
+  out.append(dayCard);
 
-  body.append(importExportBlock(ctx));
+  out.append(importExportBlock(ctx));
 }
 
 function importExportBlock(ctx) {
@@ -635,7 +740,9 @@ async function draw(ctx, body, events) {
   if (!events) events = await ctx.db.all(STORE, { index: 'date' });
   if (token !== drawToken) return;
   const frag = h('div');
-  if (state.view === 'agenda') await drawAgenda(ctx, frag, events); else await drawMonth(ctx, frag, events);
+  // Handlers inside the view must redraw the real body, never `frag` (it is emptied into body below and then detached).
+  const redraw = () => draw(ctx, body, events);
+  if (state.view === 'agenda') await drawAgenda(ctx, frag, events); else await drawMonth(ctx, frag, events, redraw);
   if (token !== drawToken) return;
   clear(body);
   while (frag.firstChild) body.append(frag.firstChild);
