@@ -15,9 +15,31 @@ Everything is stored **only on your phone** (IndexedDB). Nothing leaves the devi
 
 ---
 
-## 1. Put it on your phone (10 minutes, free)
+## 0. How this copy is deployed (already set up)
 
-The app is a PWA (Progressive Web App). It needs to be served over HTTPS once; after that it installs to the home screen, runs full-screen and works offline.
+- **Code:** private GitHub repo <https://github.com/shewskis/lifeos> (this folder is the checkout; the app lives in `lifeos/`).
+- **Hosting:** Netlify site **boisterous-sorbet-ad513a** → <https://boisterous-sorbet-ad513a.netlify.app>, linked to that repo. `netlify.toml` publishes `lifeos/` with no build step.
+- **Publishing a change:** commit and push to `main`. Netlify builds in about 20 seconds and the installed app shows "Update ready → Reload" on next open.
+
+```bash
+git add -A && git commit -m "Describe the change" && git push
+```
+
+Before pushing a code change, bump `VERSION` in `lifeos/sw.js` (and `LIFEOS_VERSION` in `lifeos/index.html`) so phones drop the cached files.
+
+**Site protection:** Netlify turned on "team login" protection for this site (`sso_login`). While it is on, only people logged in to your Netlify team can open the URL, so your phone gets a login page. Turn it off once in the dashboard: *Site configuration → Access & security → Site protection → None (public)*. The app itself keeps all data on the device, so a public URL exposes only the code.
+
+Check a deploy or trigger one by hand from this folder (the Netlify CLI is linked to the site):
+
+```bash
+npx netlify-cli deploy:list
+```
+
+---
+
+## 1. Hosting it yourself elsewhere (reference)
+
+The app is a PWA (Progressive Web App). Any static HTTPS host works; it needs to be served over HTTPS once; after that it installs to the home screen, runs full-screen and works offline.
 
 ### Option A — Netlify Drop (easiest)
 1. Go to <https://app.netlify.com/drop> (free account).
