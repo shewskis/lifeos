@@ -1,9 +1,9 @@
 // Service worker: cache the app shell so LifeOS opens offline. Bump VERSION when files change.
-const VERSION = 'lifeos-v1.5.0';
+const VERSION = 'lifeos-v1.6.0';
 const SHELL = [
   './', './index.html', './manifest.webmanifest', './css/app.css',
   './js/app.js', './js/db.js', './js/ui.js', './js/report.js', './js/modules/index.js',
-  './js/modules/dreams.js', './js/modules/weight.js', './js/modules/photos.js', './js/modules/notes.js', './js/modules/ideas.js',
+  './js/modules/dreams.js', './js/modules/weight.js', './js/modules/photos.js', './js/modules/face.js', './js/modules/notes.js', './js/modules/ideas.js',
   './js/modules/calendar.js', './js/modules/finances.js', './js/modules/tasks.js', './js/modules/goals.js',
   './js/modules/habits.js', './js/modules/ai.js',
   './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png',

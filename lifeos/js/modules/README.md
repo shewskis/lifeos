@@ -111,7 +111,7 @@ CSS classes available (css/app.css): `.card .card-title .list .list-item .li-* .
 .cal-grid .cal-dow .cal-day(.other/.today/.selected) .dots .dot  |  .habit-row .habit-days .habit-cell(.done/.today)  |  .photo-grid .photo-thumb .compare .camera-wrap(.mirror) .ghost .shutter
 .chat .msg(.user/.ai) .chat-input-bar .suggestions .typing  |  .amount(.pos/.neg) .priority-dot(.p-high/.p-med/.p-low) .streak .notice(.info) .pill-date`
 
-Icons: home body mind plan money ai plus back close check trash edit settings camera scale moon note bulb task goal calendar habit chevron search share download upload send key info flame arrowUp arrowDown more copy refresh star filter swap eye grid.
+Icons: home body mind plan money ai plus back close check trash edit settings camera face scale moon note bulb task goal calendar habit chevron search share download upload send key info flame arrowUp arrowDown more copy refresh star filter swap eye grid.
 
 ## Rules
 
