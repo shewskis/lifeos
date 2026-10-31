@@ -1,5 +1,5 @@
 // Service worker: cache the app shell so LifeOS opens offline. Bump VERSION when files change.
-const VERSION = 'lifeos-v1.4.2';
+const VERSION = 'lifeos-v1.5.0';
 const SHELL = [
   './', './index.html', './manifest.webmanifest', './css/app.css',
   './js/app.js', './js/db.js', './js/ui.js', './js/report.js', './js/modules/index.js',
