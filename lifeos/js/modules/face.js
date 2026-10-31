@@ -209,7 +209,16 @@ async function openCamera(ctx, { angle: startAngle } = {}) {
     clear(body); body.append(liveStage);
     clear(noticeBox); camWrap.classList.remove('hidden'); ghostCap.classList.remove('hidden'); controls.classList.remove('hidden');
     paintStep();
-    if (!stream) startStream();
+    resumeVideo();
+  }
+  /** Removing the <video> from the page (to show the preview) pauses it, so coming back to the camera has to play it
+   *  again, or the next angle shows a frozen frame. A stream whose track ended (camera taken by another app, phone
+   *  locked) is reopened instead. */
+  function resumeVideo() {
+    const live = stream && stream.getVideoTracks().some((t) => t.readyState === 'live');
+    if (!live) { startStream(); return; }
+    if (video.srcObject !== stream) video.srcObject = stream;
+    video.play().catch(() => startStream());
   }
 
   async function startStream() {
@@ -236,6 +245,7 @@ async function openCamera(ctx, { angle: startAngle } = {}) {
   function capture() {
     const vw = video.videoWidth, vh = video.videoHeight;
     if (!vw || !vh) { toast('Camera is still starting…'); return; }
+    if (video.paused) { resumeVideo(); toast('Camera was paused — try again'); return; } // never save a stale frame
     const ratio = 3 / 4;
     let cw = vw, ch = vh;
     if (vw / vh > ratio) cw = Math.round(vh * ratio); else ch = Math.round(vw / ratio);
