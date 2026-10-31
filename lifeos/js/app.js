@@ -150,6 +150,10 @@ async function renderToday(view) {
   }
   view.append(quick);
 
+  // Install card: shown in a browser tab until the app is installed or the card is dismissed
+  const installCard = renderInstallCard();
+  if (installCard) view.append(installCard);
+
   // AI coach card
   const aiMod = MODULES.find((m) => m.id === 'ai');
   if (aiMod) {
@@ -216,8 +220,12 @@ async function renderSettings(view) {
       h('button.btn.block.danger', { onclick: wipe }, icon('trash'), 'Erase all data'))));
 
   root.append(ui.card(h('h3', 'Install on your phone'),
-    h('p.small.muted', 'Open this page in Chrome on Android → menu (⋮) → "Add to Home screen" / "Install app". It then runs full-screen and offline like a normal app.'),
-    h('p.small.muted', `Version ${window.LIFEOS_VERSION || 'dev'}`)));
+    isStandalone()
+      ? h('p.small.muted', 'LifeOS is installed and running as an app.')
+      : h('div',
+          h('p.small.muted.mb', 'Put LifeOS on your home screen: it runs full-screen and works offline like a normal app.'),
+          h('button.btn.block.primary', { onclick: installApp }, icon('download'), 'Install LifeOS')),
+    h('p.small.muted.mt', `Version ${window.LIFEOS_VERSION || 'dev'}`)));
 }
 
 async function exportBackup() {
@@ -284,17 +292,66 @@ function registerSW() {
 let deferredInstall = null;
 let installHintDue = false; // the 4 s settle timer has elapsed
 window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); deferredInstall = e; maybeShowInstallHint(); });
+window.addEventListener('appinstalled', () => {
+  deferredInstall = null;
+  settings.set('installCardDismissed', true);
+  document.querySelectorAll('.install-card').forEach((c) => c.remove());
+  toast('Installed — open LifeOS from your home screen');
+});
+function isStandalone() { return window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true; }
+
+/** Today-screen card with an Install button; null once installed or dismissed. */
+function renderInstallCard() {
+  if (isStandalone() || settings.get('installCardDismissed')) return null;
+  const card = h('div.card.install-card',
+    h('div.row', icon('download', 28),
+      h('div.grow', h('h3', 'Install on your phone'), h('div.small.muted', 'Home-screen icon, full screen, works offline')),
+      h('button.icon-btn', { 'aria-label': 'Dismiss', onclick: () => { settings.set('installCardDismissed', true); card.remove(); } }, icon('close'))),
+    h('button.btn.block.primary.mt', { onclick: installApp }, icon('download'), 'Install LifeOS'));
+  return card;
+}
+
+/** Native install prompt when the browser offers one; otherwise step-by-step instructions for this browser. */
+async function installApp() {
+  if (isStandalone()) { toast('LifeOS is already installed'); return; }
+  if (deferredInstall) {
+    const ev = deferredInstall; deferredInstall = null; // a captured prompt can be shown only once
+    try { ev.prompt(); const { outcome } = await ev.userChoice; if (outcome === 'accepted') return; } catch {}
+  }
+  showInstallHelp();
+}
+function showInstallHelp() {
+  const ua = navigator.userAgent;
+  const ios = /iPhone|iPad|iPod/.test(ua);
+  const samsung = /SamsungBrowser/.test(ua);
+  const firefox = /Firefox/.test(ua);
+  const android = /Android/.test(ua);
+  let browser, steps;
+  if (ios) { browser = 'Safari on iPhone'; steps = ['Tap the Share button (square with an arrow) at the bottom.', 'Scroll down and tap "Add to Home Screen".', 'Tap Add. LifeOS appears on your home screen.']; }
+  else if (samsung) { browser = 'Samsung Internet'; steps = ['Tap the menu (☰) at the bottom right.', 'Tap "Add page to", then "Home screen".', 'Confirm. LifeOS appears on your home screen.']; }
+  else if (firefox) { browser = 'Firefox'; steps = ['Tap the menu (⋮).', 'Tap "Install" or "Add to Home screen".', 'Confirm.']; }
+  else if (android) { browser = 'Chrome on Android'; steps = ['Tap the menu (⋮) at the top right.', 'Tap "Install app" (on some phones it says "Add to Home screen").', 'Tap Install. LifeOS appears on your home screen and in your app list.']; }
+  else { browser = 'Chrome on a computer'; steps = ['Click the install icon at the right end of the address bar (a screen with a down arrow).', 'Or open the menu (⋮), then "Cast, save and share", then "Install page as app".']; }
+  sheet({
+    title: 'Install LifeOS',
+    content: h('div',
+      h('p.muted', `In ${browser}:`),
+      h('ol.install-steps', steps.map((s) => h('li', s))),
+      h('p.small.muted.mt', 'Already installed? Open LifeOS from your home screen instead of the browser tab.')),
+    actions: [{ label: 'Got it', primary: true }],
+  });
+}
 function showInstallHintOnce() {
-  if (settings.get('installHintShown') || window.matchMedia('(display-mode: standalone)').matches) return;
+  if (settings.get('installHintShown') || isStandalone()) return;
   setTimeout(() => { installHintDue = true; maybeShowInstallHint(); }, 4000);
 }
 // Chrome fires beforeinstallprompt only after the manifest and service worker are ready, which can be after the timer;
 // show the hint when both have happened, and mark it as shown only when it was actually shown.
 function maybeShowInstallHint() {
   if (!installHintDue || !deferredInstall || settings.get('installHintShown')) return;
-  if (window.matchMedia('(display-mode: standalone)').matches) return;
+  if (isStandalone()) return;
   settings.set('installHintShown', true);
-  toast('Install LifeOS on your home screen', { ms: 8000, action: 'Install', onAction: () => deferredInstall.prompt() });
+  toast('Install LifeOS on your home screen', { ms: 8000, action: 'Install', onAction: installApp });
 }
 
 window.lifeos = app;
