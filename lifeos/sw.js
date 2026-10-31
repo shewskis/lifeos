@@ -1,0 +1,26 @@
+// Service worker: cache the app shell so LifeOS opens offline. Bump VERSION when files change.
+const VERSION = 'lifeos-v1.0.0';
+const SHELL = [
+  './', './index.html', './manifest.webmanifest', './css/app.css',
+  './js/app.js', './js/db.js', './js/ui.js', './js/report.js', './js/modules/index.js',
+  './js/modules/dreams.js', './js/modules/weight.js', './js/modules/photos.js', './js/modules/notes.js',
+  './js/modules/calendar.js', './js/modules/finances.js', './js/modules/tasks.js', './js/modules/goals.js',
+  './js/modules/habits.js', './js/modules/ai.js',
+  './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png',
+];
+
+self.addEventListener('install', (e) => {
+  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+});
+self.addEventListener('activate', (e) => {
+  e.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== VERSION).map((k) => caches.delete(k)))).then(() => self.clients.claim()));
+});
+self.addEventListener('fetch', (e) => {
+  const url = new URL(e.request.url);
+  if (e.request.method !== 'GET' || url.origin !== location.origin) return; // never touch API calls
+  // stale-while-revalidate for same-origin shell files
+  e.respondWith(caches.match(e.request).then((cached) => {
+    const fetched = fetch(e.request).then((res) => { if (res.ok) caches.open(VERSION).then((c) => c.put(e.request, res.clone())); return res; }).catch(() => cached);
+    return cached || fetched;
+  }));
+});
