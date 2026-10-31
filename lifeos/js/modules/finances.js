@@ -160,6 +160,45 @@ function openCategorySheet(ctx, cat, txs, m, budget) {
   });
 }
 
+// ---------- AI action helpers (module-private) ----------
+const isDateKey = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && dates.key(dates.parse(s)) === s;
+function reqDate(v, name, def) {
+  if (v == null || v === '') return def;
+  if (!isDateKey(v)) throw new Error(`${name} must be a date in YYYY-MM-DD format`);
+  return v;
+}
+const txLine = (t) => `${t.id} ${dateOf(t) || '????-??-??'} ${isIncome(t) ? '+' : '-'}${amt(t).toFixed(2)} ${catOf(t)}${noteOf(t) ? ': ' + noteOf(t).replace(/\s+/g, ' ').slice(0, 60) : ''}${t?.recurring ? ' [recurring]' : ''}`;
+const budgetMapOf = (budgets) => { const m = {}; for (const b of budgets) if (b?.category && num(b.monthly) > 0) m[b.category] = num(b.monthly); return m; };
+async function getTx(ctx, id) {
+  const key = String(id || '').trim();
+  if (!key) throw new Error('id is required');
+  const t = await ctx.db.get('transactions', key);
+  if (!t) throw new Error(`No transaction with id ${key}`);
+  return t;
+}
+// Preview helpers (never throw): a date the way the UI shows it, and a transaction named like its list row.
+const dateText = (d) => { try { return isDateKey(d) ? dates.label(d) : String(d || ''); } catch { return String(d || ''); } };
+const txName = (t) => {
+  const kind = isIncome(t) ? 'income' : 'expense';
+  const note = noteOf(t).replace(/\s+/g, ' ').trim();
+  const title = note ? `"${note.slice(0, 60)}"` : catOf(t);
+  const details = [note ? catOf(t) : null, money(amt(t)), dateOf(t) ? dateText(dateOf(t)) : null, t?.recurring ? 'recurring' : null].filter(Boolean);
+  return `${kind} ${title} (${details.join(', ')})`;
+};
+async function findTx(ctx, id) {
+  try { const key = String(id || '').trim(); return key ? (await ctx.db.get('transactions', key)) || null : null; } catch { return null; }
+}
+async function findBudget(ctx, cat) {
+  try {
+    const raw = String(cat || '').trim();
+    const c = raw.toLowerCase();
+    if (!c) return null;
+    const budgets = await ctx.db.all('budgets');
+    // Same lookup order as set_budget.run: exact name first, then case-insensitive.
+    return budgets.find((b) => b?.category === raw) || budgets.find((b) => String(b?.category || '').toLowerCase() === c) || null;
+  } catch { return null; }
+}
+
 // ---------- module ----------
 export default {
   id: 'finances',
@@ -505,4 +544,144 @@ export default {
     }
     return lines.join('\n').slice(0, 8000);
   },
+
+  actions: [
+    {
+      name: 'add',
+      description: 'Add a money transaction (expense or income). Amount is a positive number in the user\'s currency. Date defaults to today. Set recurring for subscriptions/salary.',
+      params: {
+        amount: { type: 'number', description: 'Amount > 0 (always positive; type decides direction)' },
+        type: { type: 'string', enum: ['expense', 'income'], description: 'expense (default) or income' },
+        category: { type: 'string', description: `Category. Expense defaults: ${EXPENSE_CATS.join(', ')}. Income defaults: ${INCOME_CATS.join(', ')}. Any custom name is allowed. Defaults to Other.` },
+        date: { type: 'string', description: 'Date YYYY-MM-DD (default today)' },
+        note: { type: 'string', description: 'What it was (optional)' },
+        recurring: { type: 'boolean', description: 'Mark as recurring/subscription' },
+      },
+      required: ['amount'],
+      write: true,
+      preview: (a) => `Add ${a.type === 'income' ? 'income' : 'expense'} ${money(Math.abs(num(a.amount)))} · ${String(a.category || 'Other').trim() || 'Other'}${a.note ? ` "${String(a.note).trim()}"` : ''} on ${dateText(a.date || dates.today())}${a.recurring ? ' (recurring)' : ''}`,
+      async run(ctx, a) {
+        const amount = Math.abs(num(a.amount));
+        if (!(amount > 0)) throw new Error('amount must be a number greater than 0');
+        if (a.type != null && a.type !== '' && a.type !== 'expense' && a.type !== 'income') throw new Error('type must be "expense" or "income"');
+        const category = String(a.category || '').trim() || 'Other';
+        const rec = {
+          type: a.type === 'income' ? 'income' : 'expense',
+          amount: round2(amount),
+          category,
+          note: String(a.note || '').trim(),
+          date: reqDate(a.date, 'date', dates.today()),
+          recurring: !!a.recurring,
+        };
+        const saved = await ctx.db.put('transactions', rec);
+        return `Added ${saved.type} ${money(saved.amount)} ${saved.category}${saved.note ? ': ' + saved.note : ''} on ${saved.date} (id ${saved.id})${saved.recurring ? ' [recurring]' : ''}`;
+      },
+    },
+    {
+      name: 'list',
+      description: 'List transactions with ids and totals. Defaults to the current month; pass from/to for another range. Filter by type, category or a search word (matches note and category).',
+      params: {
+        from: { type: 'string', description: 'Start date YYYY-MM-DD inclusive (default first day of current month)' },
+        to: { type: 'string', description: 'End date YYYY-MM-DD inclusive (default today)' },
+        type: { type: 'string', enum: ['expense', 'income', 'all'], description: 'Filter by type (default all)' },
+        category: { type: 'string', description: 'Exact category name (case-insensitive)' },
+        query: { type: 'string', description: 'Word to search in note/category' },
+        limit: { type: 'number', description: 'Max rows to return, 1–20 (default 20)' },
+      },
+      write: false,
+      async run(ctx, a = {}) {
+        const today = dates.today();
+        const from = reqDate(a.from, 'from', thisMonth() + '-01');
+        const to = reqDate(a.to, 'to', today);
+        if (from > to) throw new Error('from must be on or before to');
+        if (a.type != null && a.type !== '' && !['expense', 'income', 'all'].includes(a.type)) throw new Error('type must be expense, income or all');
+        const limit = Math.max(1, Math.min(20, Math.floor(num(a.limit)) || 20));
+        const cat = String(a.category || '').trim().toLowerCase();
+        const q = String(a.query || '').trim().toLowerCase();
+        let txs = await ctx.db.range('transactions', from, to);
+        if (a.type === 'expense') txs = txs.filter((t) => !isIncome(t));
+        else if (a.type === 'income') txs = txs.filter(isIncome);
+        if (cat) txs = txs.filter((t) => catOf(t).toLowerCase() === cat);
+        if (q) txs = txs.filter((t) => noteOf(t).toLowerCase().includes(q) || catOf(t).toLowerCase().includes(q));
+        txs = sortDesc(txs);
+        const inc = sum(txs.filter(isIncome)), exp = sum(txs.filter((t) => !isIncome(t)));
+        const net = inc - exp;
+        const head = `${txs.length} transaction${txs.length === 1 ? '' : 's'} ${from} → ${to}: income ${money(inc)}, expenses ${money(exp)}, net ${net >= 0 ? '+' : ''}${money(net)}.`;
+        if (!txs.length) return head;
+        const lines = [head, '(id date ±amount Category: note)', ...txs.slice(0, limit).map(txLine)];
+        if (txs.length > limit) lines.push(`… ${txs.length - limit} more not shown; narrow with from/to, type, category or query.`);
+        return lines.join('\n').slice(0, 1500);
+      },
+    },
+    {
+      name: 'delete',
+      description: 'Delete a transaction by id (get ids from finances_list).',
+      params: { id: { type: 'string', description: 'Transaction id' } },
+      required: ['id'],
+      write: true,
+      preview: async (a, ctx) => { const t = await findTx(ctx, a.id); return t ? `Delete ${txName(t)}` : `Delete transaction ${a.id}`; },
+      async run(ctx, a) {
+        const t = await getTx(ctx, a.id);
+        await ctx.db.delete('transactions', t.id);
+        return `Deleted ${txLine(t)}`;
+      },
+    },
+    {
+      name: 'budgets',
+      description: 'Show monthly budgets per expense category and how much of each is spent this month (or a given month).',
+      params: { month: { type: 'string', description: 'Month YYYY-MM (default current month)' } },
+      write: false,
+      async run(ctx, a = {}) {
+        let m = String(a.month || '').trim() || thisMonth();
+        if (!/^\d{4}-\d{2}$/.test(m) || !isDateKey(m + '-01')) throw new Error('month must be YYYY-MM');
+        const [budgets, txs] = await Promise.all([ctx.db.all('budgets'), ctx.db.range('transactions', ...monthRange(m))]);
+        const map = budgetMapOf(budgets);
+        const cats = Object.keys(map).sort();
+        if (!cats.length) return 'No budgets set. Use finances_set_budget to add one.';
+        const spentBy = Object.fromEntries(byCategory(txs.filter((t) => !isIncome(t))));
+        const total = Object.values(map).reduce((s, v) => s + v, 0);
+        const spentBudgeted = cats.reduce((s, c) => s + (spentBy[c] || 0), 0);
+        const lines = [`Budgets for ${m}: ${money(spentBudgeted)} of ${money(total)} total.`];
+        for (const c of cats.slice(0, 20)) {
+          const spent = spentBy[c] || 0, b = map[c], diff = spent - b;
+          lines.push(`- ${c}: ${money(spent)} of ${money(b)} (${diff > 0 ? 'OVER by ' + money(diff) : money(-diff) + ' left'})`);
+        }
+        if (cats.length > 20) lines.push(`… ${cats.length - 20} more categories not shown.`);
+        return lines.join('\n').slice(0, 1500);
+      },
+    },
+    {
+      name: 'set_budget',
+      description: 'Set the monthly budget for an expense category (creates the category budget if new). Pass monthly 0 to remove the budget.',
+      params: {
+        category: { type: 'string', description: 'Expense category name' },
+        monthly: { type: 'number', description: 'Monthly budget amount; 0 clears it' },
+      },
+      required: ['category', 'monthly'],
+      write: true,
+      preview: async (a, ctx) => {
+        const cat = String(a.category || '').trim();
+        const b = await findBudget(ctx, cat);
+        const name = b?.category || cat;
+        const cur = b && num(b.monthly) > 0 ? money(b.monthly) : null;
+        if (num(a.monthly) > 0) return `Set ${name} budget to ${money(a.monthly)} / month${cur ? ` (was ${cur})` : ' (new budget)'}`;
+        return cur ? `Clear ${name} budget (currently ${cur} / month)` : `Clear budget for ${name}`;
+      },
+      async run(ctx, a) {
+        const cat = String(a.category || '').trim();
+        if (!cat) throw new Error('category is required');
+        const v = Number(a.monthly);
+        if (!Number.isFinite(v) || v < 0) throw new Error('monthly must be a number ≥ 0');
+        const budgets = await ctx.db.all('budgets');
+        const existing = budgets.find((b) => b?.category === cat) || budgets.find((b) => String(b?.category || '').toLowerCase() === cat.toLowerCase()) || null;
+        if (!(v > 0)) {
+          if (!existing) return `No budget for ${cat} to clear`;
+          await ctx.db.delete('budgets', existing.id);
+          return `Cleared budget for ${existing.category} (id ${existing.id})`;
+        }
+        const b = await ctx.db.put('budgets', { ...(existing || {}), category: existing?.category || cat, monthly: round2(v) });
+        return `${b.category}: ${money(b.monthly)} / month (budget id ${b.id})`;
+      },
+    },
+  ],
 };

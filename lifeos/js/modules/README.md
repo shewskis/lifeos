@@ -35,8 +35,45 @@ export default {
 
   // Optional: extra controls for the Settings screen. Return a Node.
   async settings(ctx) {},
+
+  // Optional: things the AI assistant may do on the user's behalf (see "Actions" below).
+  actions: [],
 };
 ```
+
+## Actions (AI assistant tools)
+
+The AI Coach turns every module's `actions` into tools the model can call ("add a task for tomorrow", "log 82.4 kg",
+"park the podcast idea"). Each action:
+
+```js
+{
+  name: 'add',                      // [a-z0-9_]+, unique within the module. Tool name becomes '<moduleId>_<name>'.
+  description: 'Add a task. Dates are YYYY-MM-DD; omit date for no due date.',  // what + when to use it; the model reads this
+  params: {                         // JSON-Schema properties (type, description, enum …). Keep them flat and few.
+    title: { type: 'string', description: 'Short task title' },
+    date: { type: 'string', description: 'Due date YYYY-MM-DD' },
+  },
+  required: ['title'],              // optional
+  write: true,                      // true = changes data (needs the user's OK unless they turned confirmation off); false = read-only
+  destructive: true,                // optional: cannot be undone → always confirmed, even with confirmation turned off. Actions named
+                                    // 'delete' or 'clear_day' are treated as destructive automatically.
+  preview: (args) => `Add task "${args.title}"${args.date ? ' due ' + args.date : ''}`,   // one human line shown in the confirmation card (write actions)
+  // preview may be async and receives ctx as its 2nd argument: actions that take an id should look the record up and
+  // name it ("Delete task \"Call the dentist\" (due Sat 1 Nov)"), falling back to the id if it is not found.
+  async run(ctx, args) { ... return 'Added task "Gym" (id 3f2a) due 2026-11-01'; },        // returns a SHORT plain-text result for the model
+}
+```
+
+Rules for actions:
+1. **Reads are free, writes are gated.** Mark anything that puts/deletes as `write: true`. Read actions (`list`, `search`, `summary`) let the model
+   find records; always include each record's `id` (and a one-line summary) in their output so the model can reference it in a later write.
+2. **Validate, then reuse the module's own helpers** (`norm`, `quickAdd`, `toggleDone`, …) so an action behaves exactly like the UI would —
+   same defaults, same side effects (e.g. repeating tasks), same `db:change` events. Never duplicate business logic.
+3. **Throw `new Error('…')` with a plain message** for bad input or a missing id; the AI module reports it to the model, which will ask the user.
+4. **Return value is text for the model**, not UI: concise, include ids and dates, ≤ ~1,500 characters (truncate lists, say so).
+5. Dates `'YYYY-MM-DD'`, times `'HH:MM'`, money as plain numbers in the user's currency, weight in the user's unit (`ctx.settings.get('units')`).
+6. 2–5 actions per module: usually `add`, `list`, one or two state changes (`complete`, `set_status`), `delete` only where the UI has it.
 
 ## ctx
 

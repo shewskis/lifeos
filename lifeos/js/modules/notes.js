@@ -61,6 +61,42 @@ function streakOf(notes) {
   return s;
 }
 
+// ---------- AI action helpers (text in / text out; reuse the record helpers above) ----------
+const ACTION_ROWS = 20;
+function argDate(v) {
+  if (v == null || v === '') return dates.today();
+  if (!isDateKey(v)) throw new Error(`Date must be YYYY-MM-DD, got "${v}"`);
+  return v;
+}
+function argScale(v, label) {
+  if (v == null || v === '') return undefined;
+  const n = clamp15(v);
+  if (n == null || Number(v) !== n) throw new Error(`${label} must be a whole number from 1 to 5`);
+  return n;
+}
+function argBool(v) {
+  if (v == null || v === '') return undefined;
+  if (typeof v === 'boolean') return v;
+  if (v === 'true' || v === 1 || v === '1') return true;
+  if (v === 'false' || v === 0 || v === '0') return false;
+  throw new Error('Expected true or false');
+}
+/** Preview helpers: name a note the way the UI would ('Sat 1 Nov ("Gym then dinner…" · mood 4/5)'). Never throw. */
+function previewDate(v) { return isDateKey(v) ? v : dates.today(); }
+async function previewNote(ctx, date) {
+  try { const n = await noteFor(ctx?.db, date); return hasContent(n) ? n : null; } catch { return null; }
+}
+function noteLabel(n) {
+  const text = snippet(n.text, 40);
+  const bits = [text ? `"${text}"` : null, n.mood != null ? `mood ${n.mood}/5` : null, n.energy != null ? `energy ${n.energy}/5` : null, n.tags.length ? '#' + n.tags.slice(0, 3).join(' #') : null, n.pinned ? 'pinned' : null].filter(Boolean);
+  return bits.length ? ` (${bits.join(' · ')})` : '';
+}
+function previewBool(v) { return v === true || v === 'true' || v === 1 || v === '1'; }
+function noteLine(n, textLen = 70) {
+  const meta = [n.mood != null ? `mood ${n.mood}` : null, n.energy != null ? `energy ${n.energy}` : null].filter(Boolean).join(', ');
+  return `${n.date} (id ${n.id})${meta ? ' ' + meta : ''}${n.tags.length ? ' [' + n.tags.join(', ') + ']' : ''}${n.pinned ? ' ★' : ''}: ${snippet(n.text, textLen) || '(no text)'}`;
+}
+
 /** Range slider 1–5 with a "Not set" state and a clear button. */
 function slider(label, value, fmtValue, lo, hi, onChange) {
   const wrap = h('div.field.notes-slider');
@@ -443,4 +479,138 @@ export default {
     if (truncated) lines.push('…(older notes omitted)');
     return lines.join('\n');
   },
+
+  actions: [
+    {
+      name: 'set_day',
+      description: 'Write or update the single daily note for a date (defaults to today). Only the fields you pass change; others are kept. Use append=true to add text to the existing note instead of replacing it. Use clear_day to remove a note.',
+      params: {
+        date: { type: 'string', description: 'Day of the note, YYYY-MM-DD. Defaults to today.' },
+        text: { type: 'string', description: 'Journal text. Replaces the existing text unless append is true. Pass "" to clear the text.' },
+        append: { type: 'boolean', description: 'If true, add text as a new paragraph after the existing text and merge tags instead of replacing.' },
+        mood: { type: 'integer', enum: [1, 2, 3, 4, 5], description: 'Mood 1 (awful) to 5 (great).' },
+        energy: { type: 'integer', enum: [1, 2, 3, 4, 5], description: 'Energy 1 (drained) to 5 (buzzing).' },
+        tags: { type: 'string', description: 'Comma-separated tags, e.g. "work, gym". Replaces existing tags unless append is true. Pass "" to clear.' },
+        pinned: { type: 'boolean', description: 'Pin or unpin the day.' },
+      },
+      write: true,
+      preview: async (a = {}, ctx) => {
+        const date = previewDate(a.date);
+        const bits = [];
+        try {
+          const append = previewBool(a.append);
+          if (a.text != null) bits.push(a.text === '' ? 'clear the text' : `${append ? 'append' : 'set'} text "${snippet(String(a.text), 50)}"`);
+          if (a.mood != null && a.mood !== '') { const m = clamp15(a.mood); bits.push(`mood ${a.mood}/5${m ? ' ' + MOOD[m][0] + ' ' + MOOD[m][1] : ''}`); }
+          if (a.energy != null && a.energy !== '') { const e = clamp15(a.energy); bits.push(`energy ${a.energy}/5${e ? ' (' + ENERGY[e] + ')' : ''}`); }
+          if (a.tags != null) bits.push(a.tags === '' ? 'clear the tags' : `${append ? 'add' : 'set'} tags ${parseTags(a.tags).map((t) => '#' + t).join(' ') || '(none)'}`);
+          if (a.pinned != null && a.pinned !== '') bits.push(previewBool(a.pinned) ? 'pin it' : 'unpin it');
+        } catch { /* keep whatever was described so far */ }
+        const what = bits.join(', ') || 'no changes';
+        const n = await previewNote(ctx, date);
+        if (n) return `Update daily note for ${dates.label(date)}${noteLabel(n)}: ${what}`;
+        return `Create daily note for ${dates.label(date)}: ${what}`;
+      },
+      async run(ctx, args = {}) {
+        const date = argDate(args.date);
+        const mood = argScale(args.mood, 'mood'), energy = argScale(args.energy, 'energy');
+        const append = argBool(args.append) === true, pinned = argBool(args.pinned);
+        if (args.text != null && typeof args.text !== 'string') throw new Error('text must be a string');
+        const hasText = args.text != null;   // '' clears the text (same as emptying the textarea)
+        const hasTags = args.tags != null;
+        if (!hasText && mood === undefined && energy === undefined && !hasTags && pinned === undefined) throw new Error('Pass at least one of text, mood, energy, tags or pinned');
+        const existing = await noteFor(ctx.db, date);
+        const base = existing || norm({ date });
+        const rec = { ...base, date };
+        if (hasText) rec.text = !append ? args.text : !args.text.trim() ? base.text : base.text.trim() ? `${base.text.replace(/\s+$/, '')}\n\n${args.text}` : args.text;
+        if (hasTags) {
+          const incoming = parseTags(args.tags);
+          rec.tags = append ? [...new Set([...base.tags, ...incoming])] : incoming;
+        }
+        if (mood !== undefined) rec.mood = mood;
+        if (energy !== undefined) rec.energy = energy;
+        if (pinned !== undefined) rec.pinned = pinned;
+        const next = norm(rec);
+        if (!hasContent(next)) {
+          // Same as the UI: an emptied note is removed rather than stored blank.
+          if (existing) { await ctx.db.delete(STORE, existing.id); return `Note for ${date} (id ${existing.id}) is now empty and was removed.`; }
+          return `Nothing to save for ${date}: the note would be empty.`;
+        }
+        const saved = norm(await ctx.db.put(STORE, next));
+        return `${existing ? 'Updated' : 'Created'} note for ${saved.date} (id ${saved.id}): mood ${saved.mood ?? '-'}, energy ${saved.energy ?? '-'}, tags [${saved.tags.join(', ')}]${saved.pinned ? ', pinned' : ''}, ${saved.text.length} chars. Text: ${snippet(saved.text, 120) || '(none)'}`;
+      },
+    },
+    {
+      name: 'get_day',
+      description: 'Read the full daily note for one date (defaults to today): id, text, mood, energy, tags, pinned.',
+      params: {
+        date: { type: 'string', description: 'YYYY-MM-DD. Defaults to today.' },
+      },
+      write: false,
+      async run(ctx, args = {}) {
+        const date = argDate(args.date);
+        const n = await noteFor(ctx.db, date);
+        if (!hasContent(n)) return `No note for ${date} (${dates.label(date)}).`;
+        const text = n.text.trim();
+        const shown = text.length > 1000 ? text.slice(0, 999).trimEnd() + '…' : text;
+        return [
+          `Note for ${n.date} (${dates.label(n.date)}), id ${n.id}${n.pinned ? ', pinned' : ''}`,
+          `Mood ${n.mood != null ? n.mood + '/5' : 'not set'}, energy ${n.energy != null ? n.energy + '/5' : 'not set'}, tags [${n.tags.join(', ')}]`,
+          shown ? `Text (${text.length} chars):\n${shown}` : 'Text: (none)',
+        ].join('\n');
+      },
+    },
+    {
+      name: 'list',
+      description: 'List recent daily notes, newest first, with ids. Filter by a number of days back and/or a search word (matches text, tags and date).',
+      params: {
+        days: { type: 'integer', description: 'How many days back from today to include (1-365). Default 14.' },
+        query: { type: 'string', description: 'Optional search text; case-insensitive match on text, tags or date.' },
+        pinned_only: { type: 'boolean', description: 'If true, only pinned notes (ignores days).' },
+      },
+      write: false,
+      async run(ctx, args = {}) {
+        const today = dates.today();
+        let days = 14;
+        if (args.days != null && args.days !== '') {
+          days = Number(args.days);
+          if (!Number.isInteger(days) || days < 1 || days > 365) throw new Error('days must be a whole number from 1 to 365');
+        }
+        const pinnedOnly = argBool(args.pinned_only) === true;
+        const q = String(args.query ?? '').trim().toLowerCase();
+        const since = dates.addDays(today, -(days - 1));
+        let rows = (await allNotes(ctx.db)).filter(hasContent);
+        if (pinnedOnly) rows = rows.filter((n) => n.pinned);
+        else rows = rows.filter((n) => n.date >= since && n.date <= today);
+        if (q) rows = rows.filter((n) => `${n.text} ${n.tags.join(' ')} ${n.date} ${dates.label(n.date)}`.toLowerCase().includes(q));
+        const scope = pinnedOnly ? 'pinned notes' : `notes from ${since} to ${today}`;
+        if (!rows.length) return `No ${scope}${q ? ` matching "${q}"` : ''}.`;
+        const moods = rows.filter((n) => n.mood != null).map((n) => n.mood), energies = rows.filter((n) => n.energy != null).map((n) => n.energy);
+        const lines = [`${rows.length} ${scope}${q ? ` matching "${q}"` : ''}. Avg mood ${moods.length ? fmt.num(avg(moods), 1) : '-'}, avg energy ${energies.length ? fmt.num(avg(energies), 1) : '-'}.`];
+        for (const n of rows.slice(0, ACTION_ROWS)) lines.push('- ' + noteLine(n, 60));
+        if (rows.length > ACTION_ROWS) lines.push(`…${rows.length - ACTION_ROWS} more not shown (narrow with days or query).`);
+        return lines.join('\n');
+      },
+    },
+    {
+      name: 'clear_day',
+      description: 'Delete the daily note for a date entirely (text, mood, energy, tags). Same as Delete in the note editor. Ask the user before calling this.',
+      params: {
+        date: { type: 'string', description: 'YYYY-MM-DD of the note to delete. Defaults to today.' },
+      },
+      write: true,
+      preview: async (a = {}, ctx) => {
+        const date = previewDate(a.date);
+        const n = await previewNote(ctx, date);
+        if (!n) return `Delete the daily note for ${dates.label(date)}`;
+        return `Delete daily note for ${dates.label(date)}${noteLabel(n)}`;
+      },
+      async run(ctx, args = {}) {
+        const date = argDate(args.date);
+        const n = await noteFor(ctx.db, date);
+        if (!n) throw new Error(`There is no note for ${date}`);
+        await ctx.db.delete(STORE, n.id);
+        return `Deleted note for ${date} (id ${n.id}).`;
+      },
+    },
+  ],
 };

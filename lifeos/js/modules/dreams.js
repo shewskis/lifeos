@@ -144,6 +144,66 @@ function row(ctx, d) {
   });
 }
 
+// ---------- AI action helpers (validate args, format short text for the model) ----------
+function actionDate(v) {
+  if (v == null || v === '') return dates.today();
+  const s = String(v).trim();
+  // Same check as the tasks module: shape AND a real calendar day (the UI's date input can never produce 2026-02-30).
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || Number.isNaN(dates.parse(s).getTime()) || dates.key(dates.parse(s)) !== s) throw new Error(`Invalid date "${s}": use a real YYYY-MM-DD date.`);
+  return s;
+}
+function actionTags(v) {
+  if (v == null) return [];
+  return cleanTags(Array.isArray(v) ? v : String(v).split(/[,;\n]+/));
+}
+/** 1-5 → rating; 0/''/null → null (not rated); anything else throws. */
+function actionRating(v, name) {
+  if (v == null || v === '' || v === 0 || v === '0') return null;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1 || n > 5) throw new Error(`${name} must be a whole number 1-5 (or 0 to clear).`);
+  return n;
+}
+function actionSnippet(s, n = 60) { const t = oneLine(s); return t.length > n ? t.slice(0, n).trimEnd() + ELLIPSIS : t; }
+function actionLine(d, max = 120) {
+  const title = oneLine(d.title);
+  const bits = [d.date];
+  if (d.lucid) bits.push('[lucid]');
+  const r = [];
+  if (d.mood) r.push('mood ' + d.mood);
+  if (d.vividness) r.push('vivid ' + d.vividness);
+  if (d.sleepQuality) r.push('sleep ' + d.sleepQuality);
+  if (r.length) bits.push('(' + r.join(', ') + ')');
+  bits.push((title ? title + ' ' + DASH + ' ' : '') + (actionSnippet(d.text, max) || '(no text)'));
+  if (d.tags.length) bits.push('#' + d.tags.join(' #'));
+  return bits.join(' ');
+}
+async function actionGet(ctx, id) {
+  if (id == null || !String(id).trim()) throw new Error('id is required: use dreams_list to find it.');
+  const raw = await ctx.db.get(STORE, String(id).trim());
+  if (!raw) throw new Error(`No dream with id ${id}. Use dreams_list to find the right id.`);
+  return norm(raw);
+}
+// ---------- preview helpers (never throw: a preview is only a label on the confirmation card) ----------
+/** Date as the UI shows it ("Today", "Yesterday", "Mon 12 Mar"); falls back to the raw value for anything odd. */
+function previewDate(v) {
+  if (v == null || v === '') return dates.label(dates.today());
+  const s = String(v).trim();
+  try { if (/^\d{4}-\d{2}-\d{2}$/.test(s) && dates.key(dates.parse(s)) === s) return dates.label(s); } catch { /* fall through */ }
+  return s;
+}
+/** The dream for an id, normalised, or null when the id is missing / unknown / the lookup fails. */
+async function previewGet(ctx, id) {
+  try {
+    if (!ctx || !ctx.db || id == null || !String(id).trim()) return null;
+    const raw = await ctx.db.get(STORE, String(id).trim());
+    return raw ? norm(raw) : null;
+  } catch { return null; }
+}
+/** 'dream "Flying over the city" (Yesterday)' or, when not found, 'dream <id>'. */
+function previewName(d, id) {
+  return d ? `dream "${actionSnippet(displayTitle(d), 40)}" (${previewDate(d.date)})` : `dream ${id}`;
+}
+
 export default {
   id: 'dreams',
   title: 'Dreams',
@@ -272,4 +332,134 @@ export default {
     }
     return out.join('\n');
   },
+  // ---------- AI assistant actions ----------
+  actions: [
+    {
+      name: 'add',
+      description: 'Log a dream in the dream journal. Use right after the user describes a dream. date defaults to today (YYYY-MM-DD). Ratings are 1-5; omit any the user did not mention.',
+      params: {
+        text: { type: 'string', description: 'The dream as the user told it (what happened, who was there, how it felt)' },
+        date: { type: 'string', description: 'Date of the dream, YYYY-MM-DD. Defaults to today' },
+        title: { type: 'string', description: 'Optional short name for the dream' },
+        tags: { type: 'string', description: 'Comma-separated theme tags, e.g. "flying, work, family"' },
+        mood: { type: 'integer', description: 'Mood in the dream 1-5 (1 awful, 3 okay, 5 amazing)' },
+        vividness: { type: 'integer', description: 'Vividness 1-5 (1 faint, 3 clear, 5 hyper-real)' },
+        sleep_quality: { type: 'integer', description: 'Sleep quality that night 1-5 (1 terrible, 3 okay, 5 great)' },
+        lucid: { type: 'boolean', description: 'true if the user knew they were dreaming (lucid dream)' },
+      },
+      required: ['text'],
+      write: true,
+      preview: (a) => { a = a || {}; return `Add dream for ${previewDate(a.date)}: "${actionSnippet(a.title || a.text)}"${a.lucid ? ' [lucid]' : ''}${a.tags ? ' #' + actionTags(a.tags).join(' #') : ''}`; },
+      async run(ctx, a) {
+        a = a || {};
+        const text = String(a.text || '').trim();
+        if (!text) throw new Error('text is required: describe the dream.');
+        const rec = await ctx.db.put(STORE, toRecord({
+          date: actionDate(a.date), title: a.title, text, tags: actionTags(a.tags),
+          mood: actionRating(a.mood, 'mood'), vividness: actionRating(a.vividness, 'vividness'),
+          sleepQuality: actionRating(a.sleep_quality, 'sleep_quality'), lucid: !!a.lucid,
+        }));
+        return `Added dream (id ${rec.id}) ${actionLine(norm(rec))}`;
+      },
+    },
+    {
+      name: 'list',
+      description: 'List or search dreams, newest first, with ids. Filter by free-text query (title, text, tags), a tag, a date range, or lucid only. Use it to find a dream before updating or deleting it.',
+      params: {
+        query: { type: 'string', description: 'Case-insensitive text to search in title, dream text and tags' },
+        tag: { type: 'string', description: 'Only dreams with this tag (without #)' },
+        from: { type: 'string', description: 'Earliest date YYYY-MM-DD (inclusive)' },
+        to: { type: 'string', description: 'Latest date YYYY-MM-DD (inclusive)' },
+        lucid_only: { type: 'boolean', description: 'true to list only lucid dreams' },
+        limit: { type: 'integer', description: 'Max rows to return, 1-20 (default 10)' },
+      },
+      write: false,
+      async run(ctx, a) {
+        a = a || {};
+        const from = a.from ? actionDate(a.from) : null, to = a.to ? actionDate(a.to) : null;
+        if (from && to && from > to) throw new Error('from must not be after to.');
+        const limit = Math.min(20, Math.max(1, Number(a.limit) || 10));
+        const q = oneLine(a.query).toLowerCase();
+        const tag = a.tag ? String(a.tag).trim().toLowerCase().replace(/^#/, '') : '';
+        const all = await loadAll(ctx);
+        const rows = all.filter((d) =>
+          (!from || d.date >= from) && (!to || d.date <= to) && (!a.lucid_only || d.lucid) &&
+          (!tag || d.tags.some((t) => t.toLowerCase() === tag)) &&
+          (!q || d.title.toLowerCase().includes(q) || d.text.toLowerCase().includes(q) || d.tags.some((t) => t.toLowerCase().includes(q))));
+        if (!all.length) return 'No dreams logged yet.';
+        if (!rows.length) return `No dreams match (${all.length} logged in total).`;
+        const out = [`${rows.length} dream${rows.length === 1 ? '' : 's'} match (${all.length} total). Newest first:`];
+        let shown = 0, len = out[0].length;
+        for (const d of rows.slice(0, limit)) {
+          const line = `- id ${d.id} ${actionLine(d, 80)}`;
+          if (shown && len + line.length > 1350) break; // keep the whole reply under ~1,500 chars
+          out.push(line); shown++; len += line.length + 1;
+        }
+        if (rows.length > shown) out.push(`${ELLIPSIS}and ${rows.length - shown} more. Narrow with query, tag or dates.`);
+        return out.join('\n');
+      },
+    },
+    {
+      name: 'update',
+      description: 'Edit an existing dream by id (from list). Only the fields given are changed; tags given replace the existing tags. Set a rating to 0 to clear it.',
+      params: {
+        id: { type: 'string', description: 'Dream id from list' },
+        date: { type: 'string', description: 'New date YYYY-MM-DD' },
+        title: { type: 'string', description: 'New title' },
+        text: { type: 'string', description: 'New dream text (replaces the old text)' },
+        tags: { type: 'string', description: 'Comma-separated tags; replaces all existing tags' },
+        mood: { type: 'integer', description: 'Mood 1-5, or 0 to clear' },
+        vividness: { type: 'integer', description: 'Vividness 1-5, or 0 to clear' },
+        sleep_quality: { type: 'integer', description: 'Sleep quality 1-5, or 0 to clear' },
+        lucid: { type: 'boolean', description: 'Mark as lucid (true) or not (false)' },
+      },
+      required: ['id'],
+      write: true,
+      preview: async (a, ctx) => {
+        a = a || {};
+        const d = await previewGet(ctx, a.id);
+        const ratingWord = (v, labels) => { const n = Number(v); return n === 0 || v === '0' ? 'clear' : labels[n] ? `${labels[n]} (${n}/5)` : String(v); };
+        const parts = [];
+        if (a.date != null) parts.push('move to ' + previewDate(a.date));
+        if (a.title != null) parts.push('title → "' + actionSnippet(a.title, 40) + '"');
+        if (a.text != null) parts.push('replace the text with "' + actionSnippet(a.text, 40) + '"');
+        if (a.tags != null) { const tags = actionTags(a.tags); parts.push(tags.length ? 'tags → #' + tags.join(' #') : 'remove all tags'); }
+        if (a.mood != null) parts.push('mood → ' + ratingWord(a.mood, MOOD_LABELS));
+        if (a.vividness != null) parts.push('vividness → ' + ratingWord(a.vividness, VIVID_LABELS));
+        if (a.sleep_quality != null) parts.push('sleep quality → ' + ratingWord(a.sleep_quality, SLEEP_LABELS));
+        if (a.lucid != null) parts.push(a.lucid ? 'mark as lucid' : 'mark as not lucid');
+        return `Update ${previewName(d, a.id)}: ${parts.join(', ') || 'no changes'}`;
+      },
+      async run(ctx, a) {
+        a = a || {};
+        const d = await actionGet(ctx, a.id);
+        const v = toFormValues(d);
+        let changed = false;
+        if (a.date != null) { v.date = actionDate(a.date); changed = true; }
+        if (a.title != null) { v.title = String(a.title); changed = true; }
+        if (a.text != null) { if (!String(a.text).trim()) throw new Error('text cannot be empty.'); v.text = String(a.text); changed = true; }
+        if (a.tags != null) { v.tags = actionTags(a.tags); changed = true; }
+        for (const [key, field] of [['mood', 'mood'], ['vividness', 'vividness'], ['sleep_quality', 'sleepQuality']]) {
+          if (a[key] != null) { v[field] = actionRating(a[key], key); changed = true; }
+        }
+        if (a.lucid != null) { v.lucid = !!a.lucid; changed = true; }
+        if (!changed) throw new Error('Nothing to update: give at least one field besides id.');
+        const rec = await ctx.db.put(STORE, toRecord(v, d));
+        return `Updated dream (id ${rec.id}) ${actionLine(norm(rec))}`;
+      },
+    },
+    {
+      name: 'delete',
+      description: 'Permanently delete a dream by id (from list). Ask the user first unless they clearly asked to delete it.',
+      params: { id: { type: 'string', description: 'Dream id from list' } },
+      required: ['id'],
+      write: true,
+      preview: async (a, ctx) => { a = a || {}; const d = await previewGet(ctx, a.id); return `Delete ${previewName(d, a.id)}`; },
+      async run(ctx, a) {
+        const d = await actionGet(ctx, a && a.id);
+        await ctx.db.delete(STORE, d.id);
+        return `Deleted dream (id ${d.id}) from ${d.date}: "${actionSnippet(displayTitle(d))}"`;
+      },
+    },
+  ],
 };

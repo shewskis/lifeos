@@ -300,4 +300,195 @@ export default {
     if (truncated) lines.push('…(older ideas omitted)');
     return lines.join('\n');
   },
+
+  // ---------- AI assistant actions ----------
+  actions: [
+    {
+      name: 'add',
+      description: 'Capture a new idea. "#tags" inside the title are extracted like the quick-capture bar. Defaults: status new, not starred, date today.',
+      params: {
+        title: { type: 'string', description: 'One line that captures the idea (may contain #tags)' },
+        text: { type: 'string', description: 'Optional details: why it matters, how it could work, first step' },
+        tags: { type: 'string', description: 'Comma/space-separated tags, e.g. "app, business" (merged with #tags from the title)' },
+        status: { type: 'string', enum: Object.keys(STATUS), description: 'Initial status (default new)' },
+        starred: { type: 'boolean', description: 'Star the idea so it floats to the top (default false)' },
+        date: { type: 'string', description: 'Captured-on date YYYY-MM-DD (default today)' },
+      },
+      required: ['title'],
+      write: true,
+      preview: (args) => {
+        try {
+          const parsed = parseQuick(args.title);
+          const title = snippet((parsed && parsed.title) || args.title, 60) || 'Untitled idea';
+          const tags = uniq([...((parsed && parsed.tags) || []), ...parseTags(args.tags)]);
+          const tagStr = tags.length ? ' ' + tags.map((t) => '#' + t).join(' ') : '';
+          const star = parseBoolSafe(args.starred) ? ' ★' : '';
+          const status = args.status && args.status !== 'new' ? ' as ' + (STATUS[args.status] ? STATUS[args.status].label.toLowerCase() : args.status) : '';
+          const date = isDateKey(args.date) && args.date !== dates.today() ? ' captured ' + dateLabel(args.date) : '';
+          return `Add idea "${title}"${tagStr}${star}${status}${date}`;
+        } catch { return `Add idea "${snippet(args.title, 60)}"`; }
+      },
+      async run(ctx, args) {
+        const parsed = parseQuick(args.title);
+        if (!parsed || !parsed.title) throw new Error('title is required');
+        if (args.status != null && !STATUS[args.status]) throw new Error(`status must be one of: ${Object.keys(STATUS).join(', ')}`);
+        if (args.date != null && args.date !== '' && !isDateKey(args.date)) throw new Error('date must be YYYY-MM-DD');
+        const text = [String(args.text ?? '').trim(), parsed.text].filter(Boolean).join('\n');
+        const rec = norm({
+          ...parsed,
+          text,
+          tags: [...parsed.tags, ...parseTags(args.tags)],
+          status: args.status || 'new',
+          starred: parseBool(args.starred, false),
+          date: isDateKey(args.date) ? args.date : dates.today(),
+        });
+        const saved = await ctx.db.put(STORE, rec);
+        return `Added idea "${saved.title}" (id ${saved.id}) on ${saved.date}, status ${saved.status}${saved.starred ? ', starred' : ''}${saved.tags.length ? ', tags: ' + saved.tags.join(', ') : ''}.`;
+      },
+    },
+    {
+      name: 'list',
+      description: 'List ideas with their ids. filter: active (new + exploring, default), starred, parked, done or all. query matches title, details and tags. Starred ideas come first, then newest.',
+      params: {
+        filter: { type: 'string', enum: ['active', 'starred', 'parked', 'done', 'all'], description: 'Which ideas to show (default active)' },
+        query: { type: 'string', description: 'Optional search text (title, details, tags, status)' },
+        limit: { type: 'integer', description: 'Max rows to return (default 20, max 20)' },
+      },
+      write: false,
+      async run(ctx, args) {
+        const filter = args.filter || 'active';
+        if (!['active', 'starred', 'parked', 'done', 'all'].includes(filter)) throw new Error('filter must be active, starred, parked, done or all');
+        const q = String(args.query ?? '').trim().toLowerCase();
+        let rows = await allIdeas(ctx.db);
+        const total = rows.length;
+        if (filter === 'active') rows = rows.filter(isActive);
+        else if (filter === 'starred') rows = rows.filter((r) => r.starred);
+        else if (filter !== 'all') rows = rows.filter((r) => r.status === filter);
+        if (q) rows = rows.filter((r) => `${r.title} ${r.text} ${r.tags.join(' ')} ${STATUS[r.status].label}`.toLowerCase().includes(q));
+        rows = [...rows].sort((a, b) => (b.starred - a.starred) || (a.date < b.date ? 1 : a.date > b.date ? -1 : (b.createdAt || 0) - (a.createdAt || 0)));
+        if (!rows.length) return total ? `No ideas match (filter ${filter}${q ? `, query "${q}"` : ''}). ${total} idea(s) in total.` : 'No ideas yet.';
+        const limit = Math.min(20, Math.max(1, Number(args.limit) || 20));
+        const shown = rows.slice(0, limit);
+        const out = [`${rows.length} idea(s) (filter ${filter}${q ? `, query "${q}"` : ''}):`];
+        for (const r of shown) out.push(ideaLine(r));
+        if (rows.length > shown.length) out.push(`…${rows.length - shown.length} more not shown (narrow with query or filter).`);
+        return clampText(out.join('\n'));
+      },
+    },
+    {
+      name: 'update',
+      description: 'Change an idea by id: status (new/exploring/done/parked — use done to complete, parked to park, new to reopen), starred, title, details, tags or date. Only the fields given are changed; tags given replace the existing tags.',
+      params: {
+        id: { type: 'string', description: 'Idea id from list' },
+        status: { type: 'string', enum: Object.keys(STATUS), description: 'New status' },
+        starred: { type: 'boolean', description: 'Star (true) or unstar (false)' },
+        title: { type: 'string', description: 'New title' },
+        text: { type: 'string', description: 'New details (replaces the existing details)' },
+        tags: { type: 'string', description: 'New comma/space-separated tags (replaces existing tags; empty string clears them)' },
+        date: { type: 'string', description: 'New captured-on date YYYY-MM-DD' },
+      },
+      required: ['id'],
+      write: true,
+      preview: async (args, ctx) => {
+        const parts = [];
+        const statusLabel = args.status ? (STATUS[args.status] ? STATUS[args.status].label.toLowerCase() : String(args.status)) : '';
+        try {
+          if (args.starred != null && args.starred !== '') parts.push(parseBoolSafe(args.starred) ? 'star it' : 'unstar it');
+          if (args.title != null) parts.push(`rename to "${snippet(args.title, 40)}"`);
+          if (args.text != null) parts.push(String(args.text).trim() ? `set details to "${snippet(args.text, 40)}"` : 'clear details');
+          if (args.tags != null) { const tags = parseTags(args.tags); parts.push(tags.length ? `set tags to ${tags.map((t) => '#' + t).join(' ')}` : 'clear tags'); }
+          if (args.date) parts.push(`set captured-on date to ${isDateKey(args.date) ? dateLabel(args.date) : args.date}`);
+        } catch { /* fall through with whatever was collected */ }
+        const idea = await lookupIdea(ctx, args.id);
+        const name = idea ? `"${ideaName(idea)}"` : String(args.id ?? '');
+        // status-only change reads like the UI's row button: Mark idea "X" done
+        if (statusLabel && !parts.length) return `Mark idea ${name} ${statusLabel}`;
+        if (statusLabel) parts.unshift(`mark ${statusLabel}`);
+        return `Update idea ${name}: ${parts.join(', ') || 'no changes'}`;
+      },
+      async run(ctx, args) {
+        const existing = await findIdea(ctx.db, args.id);
+        const changes = {};
+        if (args.status != null) {
+          if (!STATUS[args.status]) throw new Error(`status must be one of: ${Object.keys(STATUS).join(', ')}`);
+          changes.status = args.status;
+        }
+        if (args.starred != null) changes.starred = parseBool(args.starred, existing.starred);
+        if (args.title != null) {
+          const title = String(args.title).trim();
+          if (!title) throw new Error('title cannot be empty');
+          changes.title = title;
+        }
+        if (args.text != null) changes.text = String(args.text);
+        if (args.tags != null) changes.tags = parseTags(args.tags);
+        if (args.date != null && args.date !== '') {
+          if (!isDateKey(args.date)) throw new Error('date must be YYYY-MM-DD');
+          changes.date = args.date;
+        }
+        if (!Object.keys(changes).length) throw new Error('Nothing to change: give at least one of status, starred, title, text, tags, date');
+        const saved = await ctx.db.put(STORE, norm({ ...existing, ...changes }));
+        const what = Object.keys(changes).map((k) => `${k}=${k === 'tags' ? saved.tags.join(',') || '(none)' : k === 'text' ? '"' + snippet(saved.text, 40) + '"' : saved[k]}`).join(', ');
+        return `Updated idea "${saved.title}" (id ${saved.id}): ${what}.`;
+      },
+    },
+    {
+      name: 'delete',
+      description: 'Permanently delete an idea by id. Prefer update with status parked or done unless the user clearly wants it gone.',
+      params: {
+        id: { type: 'string', description: 'Idea id from list' },
+      },
+      required: ['id'],
+      write: true,
+      preview: async (args, ctx) => {
+        const idea = await lookupIdea(ctx, args.id);
+        if (!idea) return `Delete idea ${args.id}`;
+        const meta = [idea.status !== 'new' ? STATUS[idea.status].label.toLowerCase() : '', idea.starred ? '★' : '', 'captured ' + dateLabel(idea.date)].filter(Boolean);
+        return `Delete idea "${ideaName(idea)}" (${meta.join(', ')})`;
+      },
+      async run(ctx, args) {
+        const existing = await findIdea(ctx.db, args.id);
+        await ctx.db.delete(STORE, existing.id);
+        return `Deleted idea "${existing.title}" (id ${existing.id}, ${existing.date}).`;
+      },
+    },
+  ],
 };
+
+// ---------- action helpers (module-private) ----------
+function parseBool(v, def) {
+  if (v == null || v === '') return def;
+  if (typeof v === 'boolean') return v;
+  const s = String(v).trim().toLowerCase();
+  if (['true', 'yes', '1', 'on'].includes(s)) return true;
+  if (['false', 'no', '0', 'off'].includes(s)) return false;
+  throw new Error('starred must be true or false');
+}
+/** Exact id first; otherwise a unique id prefix (≥ 4 chars) so the model may abbreviate. Throws when not found. */
+async function findIdea(db, id) {
+  const key = String(id ?? '').trim();
+  if (!key) throw new Error('id is required');
+  const exact = await db.get(STORE, key);
+  if (exact) return norm(exact);
+  if (key.length >= 4) {
+    const hits = (await db.all(STORE)).filter((r) => String(r.id).startsWith(key));
+    if (hits.length === 1) return norm(hits[0]);
+    if (hits.length > 1) throw new Error(`id "${key}" is ambiguous (${hits.length} ideas match); use the full id from list`);
+  }
+  throw new Error(`No idea with id "${key}". Use list to find ids.`);
+}
+/** Preview-only helpers: never throw, so a confirmation card can always be shown. */
+async function lookupIdea(ctx, id) {
+  try { return ctx && ctx.db ? await findIdea(ctx.db, id) : null; } catch { return null; }
+}
+function ideaName(r) { return snippet(r.title, 60) || 'Untitled idea'; }
+function dateLabel(key) { try { return dates.label(key); } catch { return String(key); } }
+function parseBoolSafe(v) { try { return parseBool(v, false); } catch { return !!v; } }
+function ideaLine(r) {
+  const details = snippet(r.text, 60);
+  return `- ${r.id} | ${STATUS[r.status].label}${r.starred ? ' ★' : ''} | ${r.date} | ${snippet(r.title, 80) || 'Untitled'}${r.tags.length ? ' [' + r.tags.join(', ') + ']' : ''}${details ? ' — ' + details : ''}`;
+}
+function clampText(s, max = 1500) {
+  if (s.length <= max) return s;
+  const cut = s.lastIndexOf('\n', max - 20);
+  return s.slice(0, cut > 0 ? cut : max - 20) + '\n…(truncated)';
+}

@@ -496,4 +496,187 @@ export default {
     if (archived.length) lines.push('', 'Archived: ' + archived.map(displayTitle).join(', '));
     return lines.join('\n');
   },
+
+  // ---------- AI assistant actions ----------
+  actions: [
+    {
+      name: 'add',
+      description: 'Create a new habit. schedule: "daily" (default), "weekdays", "weekends", or comma-separated weekday names like "mon,wed,fri". A leading emoji in the title is split off automatically.',
+      params: {
+        title: { type: 'string', description: 'Habit name, e.g. "Read 20 min"' },
+        emoji: { type: 'string', description: 'Optional single emoji shown next to the habit' },
+        schedule: { type: 'string', description: 'When it is due: "daily", "weekdays", "weekends", or weekday names e.g. "mon,wed,fri"' },
+      },
+      required: ['title'],
+      write: true,
+      preview: (args) => `Add habit "${String(args.title || '').trim()}" (${previewSchedule(args.schedule)})`,
+      async run(ctx, args) {
+        let title = String(args.title || '').trim();
+        let emoji = String(args.emoji || '').trim();
+        if (!emoji) { const m = title.match(EMOJI_RE); if (m && m[2]) { emoji = m[1]; title = m[2].trim(); } }
+        if (!title) throw new Error('Habit needs a title');
+        const schedule = parseScheduleArg(args.schedule);
+        const dupe = (await ctx.db.all(HABITS)).filter(Boolean).find((x) => !x.archived && String(x.title || '').trim().toLowerCase() === title.toLowerCase());
+        if (dupe) throw new Error(`A habit called "${dupe.title}" already exists (id ${dupe.id})`);
+        const rec = await createHabit(ctx, { title, emoji, schedule });
+        return `Added habit "${displayTitle(rec)}" (id ${rec.id}), ${scheduleLabel(rec, ctx)}`;
+      },
+    },
+    {
+      name: 'list',
+      description: 'List habits with id, schedule, today status, current streak and 7-day completion. Call this before changing a habit to get its id.',
+      params: {
+        include_archived: { type: 'boolean', description: 'Also list archived habits (default false)' },
+      },
+      write: false,
+      async run(ctx, args) {
+        const today = dates.today();
+        const data = await load(ctx.db);
+        const rows = data.habits.filter((x) => args?.include_archived || !x.archived);
+        if (!rows.length) return data.habits.length ? 'No active habits (all archived). Pass include_archived=true to see them.' : 'No habits yet.';
+        const MAX = 20;
+        const lines = rows.slice(0, MAX).map((hb) => {
+          const done = data.setFor(hb.id);
+          const c7 = completion(hb, done, 7, today);
+          const state = done.has(today) ? 'done today' : isDue(hb, today) ? 'NOT yet today' : 'not due today';
+          return `- ${displayTitle(hb)} [id ${hb.id}] — ${scheduleLabel(hb, ctx)}; ${state}; streak ${currentStreak(hb, done, today)}; 7d ${pctLabel(c7)} (${c7.done}/${c7.due})${hb.archived ? '; ARCHIVED' : ''}`;
+        });
+        if (rows.length > MAX) lines.push(`… ${rows.length - MAX} more not shown`);
+        return `${rows.length} habit${rows.length === 1 ? '' : 's'} (today ${today}):\n` + lines.join('\n');
+      },
+    },
+    {
+      name: 'set_done',
+      description: 'Mark a habit done (or undo it) for a date. Default date is today; future dates are not allowed. Idempotent: setting a state that already holds changes nothing.',
+      params: {
+        habit_id: { type: 'string', description: 'Habit id from habits_list (an exact habit title also works)' },
+        date: { type: 'string', description: 'Date YYYY-MM-DD (default today)' },
+        done: { type: 'boolean', description: 'true = mark done (default), false = mark not done' },
+      },
+      required: ['habit_id'],
+      write: true,
+      preview: async (args, ctx) => `${args.done === false ? 'Un-mark' : 'Mark'} habit ${await previewHabit(ctx, args.habit_id)} ${args.done === false ? 'not done' : 'done'} for ${previewDate(args.date)}`,
+      async run(ctx, args) {
+        const hb = await findHabit(ctx, args.habit_id);
+        const key = parseDateArg(args.date);
+        if (key > dates.today()) throw new Error(`Cannot log ${key}: it is in the future`);
+        const want = args.done !== false;
+        const has = (await ctx.db.where(LOGS, 'habitId', hb.id)).some((l) => l && l.date === key);
+        if (has === want) return `"${displayTitle(hb)}" (id ${hb.id}) was already ${want ? 'done' : 'not done'} on ${key}`;
+        const res = await toggleLog(ctx.db, hb.id, key);
+        if (res === undefined) throw new Error('Another change to this habit is in progress; try again');
+        const done = new Set((await ctx.db.where(LOGS, 'habitId', hb.id)).map((l) => l?.date).filter(Boolean));
+        const dueNote = isDue(hb, key) ? '' : ' (not a scheduled day)';
+        return `${want ? 'Marked' : 'Un-marked'} "${displayTitle(hb)}" (id ${hb.id}) ${want ? 'done' : 'not done'} for ${key}${dueNote}. Streak now ${currentStreak(hb, done, dates.today())}.`;
+      },
+    },
+    {
+      name: 'archive',
+      description: 'Archive a habit (hides it from the daily list, keeps its history) or restore an archived one.',
+      params: {
+        habit_id: { type: 'string', description: 'Habit id from habits_list (an exact habit title also works)' },
+        archived: { type: 'boolean', description: 'true = archive (default), false = restore' },
+      },
+      required: ['habit_id'],
+      write: true,
+      preview: async (args, ctx) => `${args.archived === false ? 'Restore' : 'Archive'} habit ${await previewHabit(ctx, args.habit_id)}${args.archived === false ? ' (back to the daily list)' : ' (hidden from the daily list, history kept)'}`,
+      async run(ctx, args) {
+        const hb = await findHabit(ctx, args.habit_id);
+        const want = args.archived !== false;
+        if (hb.archived === want) return `"${displayTitle(hb)}" (id ${hb.id}) is already ${want ? 'archived' : 'active'}`;
+        await setArchived(ctx, hb.id, want);
+        return `${want ? 'Archived' : 'Restored'} "${displayTitle(hb)}" (id ${hb.id})`;
+      },
+    },
+    {
+      name: 'delete',
+      description: 'Permanently delete a habit and all its check-ins. Prefer archive unless the user clearly wants it gone.',
+      params: {
+        habit_id: { type: 'string', description: 'Habit id from habits_list (an exact habit title also works)' },
+      },
+      required: ['habit_id'],
+      write: true,
+      preview: async (args, ctx) => `Delete habit ${await previewHabit(ctx, args.habit_id)} and all its check-ins`,
+      async run(ctx, args) {
+        const hb = await findHabit(ctx, args.habit_id);
+        const n = (await ctx.db.where(LOGS, 'habitId', hb.id)).filter(Boolean).length;
+        await deleteHabit(ctx, hb.id);
+        return `Deleted "${displayTitle(hb)}" (id ${hb.id}) and ${n} check-in${n === 1 ? '' : 's'}`;
+      },
+    },
+  ],
 };
+
+// ---------- action helpers (private) ----------
+/** Preview helper: '"📖 Read 20 min"' for a known habit (by id or exact title), else 'habit <ref>' text. Never throws. */
+async function previewHabit(ctx, ref) {
+  const q = String(ref ?? '').trim();
+  try {
+    const hb = await findHabit(ctx, q);
+    return `"${displayTitle(hb)}"`;
+  } catch {
+    return q || '(none)';
+  }
+}
+/** Preview helper: 'Today' / 'Yesterday' / 'Mon 12 Mar' for a valid YYYY-MM-DD (default today); raw text otherwise. Never throws. */
+function previewDate(raw) {
+  try {
+    const key = parseDateArg(raw);
+    return dates.label(key);
+  } catch {
+    return String(raw);
+  }
+}
+/** Preview helper: 'every day' / 'weekdays' / 'weekends' / 'Mon, Wed, Fri'; echoes the raw text when it cannot be parsed. Never throws. */
+function previewSchedule(raw) {
+  try {
+    const s = parseScheduleArg(raw);
+    if (s === 'daily') return 'every day';
+    const label = scheduleLabel({ schedule: s });
+    return label === 'Weekdays' || label === 'Weekends' ? label.toLowerCase() : label;
+  } catch {
+    return String(raw ?? '').trim() || 'every day';
+  }
+}
+const DOW_NAMES = { sun: 0, sunday: 0, mon: 1, monday: 1, tue: 2, tues: 2, tuesday: 2, wed: 3, weds: 3, wednesday: 3, thu: 4, thur: 4, thurs: 4, thursday: 4, fri: 5, friday: 5, sat: 6, saturday: 6 };
+/** "daily" | "weekdays" | "weekends" | "mon,wed,fri" → 'daily' or sorted [0..6] (same shape scheduleOf() produces). */
+function parseScheduleArg(raw) {
+  const s = String(raw ?? '').trim().toLowerCase();
+  if (!s || s === 'daily' || s === 'every day' || s === 'everyday') return 'daily';
+  if (s === 'weekdays') return [1, 2, 3, 4, 5];
+  if (s === 'weekends') return [0, 6];
+  const days = new Set();
+  for (const part of s.split(/[\s,;/]+/).filter(Boolean)) {
+    const d = DOW_NAMES[part] ?? (/^[0-6]$/.test(part) ? Number(part) : undefined);
+    if (d === undefined) throw new Error(`Unknown weekday "${part}" in schedule; use names like mon,tue,wed or "daily"/"weekdays"/"weekends"`);
+    days.add(d);
+  }
+  return scheduleOf({ schedule: [...days] });
+}
+/** Validates 'YYYY-MM-DD' (defaults to today). */
+function parseDateArg(raw) {
+  if (raw == null || String(raw).trim() === '') return dates.today();
+  const s = String(raw).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || dates.key(dates.parse(s)) !== s) throw new Error(`Invalid date "${s}"; use YYYY-MM-DD`);
+  return s;
+}
+/** Resolves a habit by id, falling back to a unique case-insensitive title match. Throws when not found. */
+async function findHabit(ctx, ref) {
+  const q = String(ref ?? '').trim();
+  if (!q) throw new Error('habit_id is required');
+  const byId = await ctx.db.get(HABITS, q);
+  if (byId) return normalize(byId);
+  const all = (await ctx.db.all(HABITS)).filter(Boolean);
+  const hits = all.filter((x) => String(x.id) === q || String(x.title || '').trim().toLowerCase() === q.toLowerCase());
+  if (hits.length === 1) return normalize(hits[0]);
+  if (hits.length > 1) throw new Error(`Several habits are called "${q}"; use the id from habits_list: ${hits.map((x) => x.id).join(', ')}`);
+  throw new Error(`No habit with id or title "${q}". Call habits_list to see ids.`);
+}
+/** Same record shape and ordering as openAdd(), without the form. */
+async function createHabit(ctx, { title, emoji, schedule }) {
+  const all = await ctx.db.all(HABITS);
+  const order = all.reduce((m, x) => Math.max(m, Number(x?.order) || 0), 0) + 1;
+  const rec = await ctx.db.put(HABITS, { title, emoji: emoji || '', schedule, color: '', archived: false, order });
+  toast('Habit added');
+  return normalize(rec);
+}

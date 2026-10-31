@@ -531,6 +531,103 @@ async function drawAgenda(ctx, body, events) {
   body.append(h('div.mt'), importExportBlock(ctx));
 }
 
+// ---------- AI actions: private helpers ----------
+const isYMD = (k) => typeof k === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(k) && dates.key(dates.parse(k)) === k;
+/** Validate an optional 'YYYY-MM-DD' arg; returns the value or `def` when absent. */
+function argDate(v, name, def) {
+  if (v === undefined || v === null || v === '') return def;
+  if (!isYMD(v)) throw new Error(`${name} must be a date in YYYY-MM-DD format`);
+  return v;
+}
+/** Validate an optional 'HH:MM' arg; returns '' when absent. */
+function argTime(v, name) {
+  if (v === undefined || v === null || v === '') return '';
+  if (!isHM(v)) throw new Error(`${name} must be a time in HH:MM format (24h)`);
+  const [hh, mm] = v.split(':').map(Number);
+  if (hh > 23 || mm > 59) throw new Error(`${name} is not a valid time`);
+  return v;
+}
+function argEnum(v, name, allowed) {
+  if (v === undefined || v === null || v === '') return undefined;
+  if (!allowed.includes(v)) throw new Error(`${name} must be one of: ${allowed.map((x) => x || '(default)').join(', ')}`);
+  return v;
+}
+/** Look up a stored event by id or throw. */
+async function requireEvent(ctx, id) {
+  if (typeof id !== 'string' || !id.trim()) throw new Error('id is required');
+  const rec = await ctx.db.get(STORE, id.trim()).catch(() => null);
+  if (!rec) throw new Error(`No event with id ${id}`);
+  return rec;
+}
+/** Map snake_case action args onto the record's camelCase fields (only keys that were given). */
+function argsToFields(a) {
+  const out = {};
+  if (a.title !== undefined) out.title = String(a.title);
+  if (a.date !== undefined && a.date !== null && a.date !== '') out.date = argDate(a.date, 'date');
+  if (a.time !== undefined) out.time = argTime(a.time, 'time');
+  if (a.end_time !== undefined) out.endTime = argTime(a.end_time, 'end_time');
+  if (a.all_day !== undefined) out.allDay = !!a.all_day;
+  if (a.location !== undefined) out.location = String(a.location);
+  if (a.notes !== undefined) out.notes = String(a.notes);
+  if (a.color !== undefined) out.color = argEnum(a.color, 'color', COLORS.map((c) => c.value)) ?? '';
+  if (a.recurrence !== undefined) out.recurrence = argEnum(a.recurrence, 'recurrence', RECURRENCE.map((r) => r.value)) ?? 'none';
+  if (a.recurrence_end !== undefined) out.recurrenceEnd = argDate(a.recurrence_end, 'recurrence_end', '');
+  if (a.duration_minutes !== undefined && a.duration_minutes !== null && a.duration_minutes !== '') {
+    const n = Number(a.duration_minutes);
+    if (!Number.isFinite(n) || n <= 0 || n > 1440) throw new Error('duration_minutes must be a number between 1 and 1440');
+    out._duration = Math.round(n);
+  }
+  return out;
+}
+/** One compact line for the model: `id · date time–end · title @ location (recurrence)`. */
+function describeEvent(ev, occDate) {
+  ev = norm(ev);
+  let s = `${ev.id} · ${occDate || ev.date} ${isTimed(ev) ? ev.time + (isHM(ev.endTime) ? '–' + ev.endTime : '') : 'all-day'} · ${ev.title}`;
+  if (ev.location) s += ` @ ${ev.location}`;
+  if (isRecurring(ev)) s += ` (${RECUR_WORD[ev.recurrence]}${ev.recurrenceEnd ? ' until ' + ev.recurrenceEnd : ''})`;
+  return s;
+}
+
+// ---------- AI actions: preview helpers (confirmation card text; never throw) ----------
+/** 'Sat 1 Nov' for a valid YYYY-MM-DD, otherwise the raw value. */
+function previewDate(k) { try { return isYMD(k) ? dates.label(k) : String(k); } catch { return String(k); } }
+/** '14:00' → '2:00 PM' (locale), raw value when it is not HH:MM. */
+function previewTime(t) { try { return fmtTime(t) || String(t); } catch { return String(t); } }
+/**
+ * 'event "Dentist" (Sat 1 Nov, 2:00 PM)' — or 'event <id>' when the record cannot be loaded.
+ * `recurringSuffix` is appended only when the stored record really is a series (e.g. ' and all its repeats').
+ */
+async function previewEvent(ctx, id, recurringSuffix = '') {
+  const fallback = `event ${id}`;
+  try {
+    if (typeof id !== 'string' || !id.trim() || !ctx?.db?.get) return fallback;
+    const rec = await ctx.db.get(STORE, id.trim());
+    if (!rec) return fallback;
+    const ev = norm(rec);
+    const when = previewDate(ev.date) + (isTimed(ev) ? ', ' + previewTime(ev.time) : '');
+    const rec_ = isRecurring(ev);
+    return `event "${ev.title}" (${when}${rec_ ? ', repeats ' + RECUR_WORD[ev.recurrence] : ''})${rec_ ? recurringSuffix : ''}`;
+  } catch { return fallback; }
+}
+/** Plain-words list of the fields an update action would change: 'title → "Dentist", start 2:00 PM, clear location'. */
+function previewChanges(a) {
+  const out = [];
+  const has = (k) => a[k] !== undefined && a[k] !== null;
+  const clearOr = (k, label, f) => { if (!has(k)) return; out.push(a[k] === '' ? `clear ${label}` : `${label} → ${f ? f(a[k]) : a[k]}`); };
+  if (has('title')) out.push(`title → "${a.title}"`);
+  if (has('date')) out.push(`date → ${previewDate(a.date)}`);
+  if (has('all_day')) out.push(a.all_day ? 'make it all-day' : 'make it timed');
+  if (has('time')) out.push(a.time === '' ? 'clear the start time (all-day)' : `start → ${previewTime(a.time)}`);
+  clearOr('end_time', 'end', previewTime);
+  if (has('duration_minutes') && a.duration_minutes !== '') out.push(`length ${a.duration_minutes} min`);
+  clearOr('location', 'location', (v) => `"${v}"`);
+  clearOr('notes', 'notes', (v) => `"${String(v).length > 40 ? String(v).slice(0, 40) + '…' : v}"`);
+  if (has('color')) out.push(a.color === '' ? 'color → default' : `color → ${a.color}`);
+  if (has('recurrence')) out.push(a.recurrence === 'none' || a.recurrence === '' ? 'stop repeating' : `repeat ${a.recurrence}`);
+  clearOr('recurrence_end', 'repeat until', previewDate);
+  return out;
+}
+
 // ---------- main draw ----------
 let drawToken = 0;
 async function draw(ctx, body, events) {
@@ -631,4 +728,137 @@ export default {
     } else lines.push('', 'No events scheduled in the next 14 days.');
     return lines.join('\n');
   },
+
+  actions: [
+    {
+      name: 'add',
+      description: 'Add a calendar event. Dates are YYYY-MM-DD (defaults to today), times HH:MM 24h. Omit time (or set all_day) for an all-day event. Give end_time or duration_minutes for the end; recurrence makes a repeating series.',
+      params: {
+        title: { type: 'string', description: 'Event title' },
+        date: { type: 'string', description: 'Date YYYY-MM-DD (default today)' },
+        time: { type: 'string', description: 'Start time HH:MM (omit for all-day)' },
+        end_time: { type: 'string', description: 'End time HH:MM' },
+        duration_minutes: { type: 'number', description: 'Length in minutes, used to compute end_time when end_time is not given' },
+        all_day: { type: 'boolean', description: 'True for an all-day event (ignores time)' },
+        location: { type: 'string', description: 'Where it happens' },
+        notes: { type: 'string', description: 'Free-text notes' },
+        color: { type: 'string', description: 'Color tag', enum: ['', 'green', 'yellow', 'red', 'purple'] },
+        recurrence: { type: 'string', description: 'Repeat rule (default none)', enum: ['none', 'daily', 'weekly', 'monthly', 'yearly'] },
+        recurrence_end: { type: 'string', description: 'Last repeat date YYYY-MM-DD (only with recurrence; empty = up to 2 years)' },
+      },
+      required: ['title'],
+      write: true,
+      preview: (a) => {
+        a = a || {};
+        let s = `Add event "${a.title}" on ${previewDate(a.date || dates.today())}`;
+        if (a.time && !a.all_day) {
+          s += ' at ' + previewTime(a.time);
+          if (a.end_time) s += ' – ' + previewTime(a.end_time);
+          else if (a.duration_minutes) s += ` (${a.duration_minutes} min)`;
+        } else s += ' (all day)';
+        if (a.location) s += ` at ${a.location}`;
+        if (a.recurrence && a.recurrence !== 'none') s += `, repeats ${a.recurrence}${a.recurrence_end ? ' until ' + previewDate(a.recurrence_end) : ''}`;
+        return s;
+      },
+      async run(ctx, args) {
+        const a = args || {};
+        if (typeof a.title !== 'string' || !a.title.trim()) throw new Error('title is required');
+        const f = argsToFields(a);
+        if (!f.allDay && f._duration && f.time && !f.endTime) f.endTime = addMinutes(f.time, f._duration);
+        delete f._duration;
+        if (f.recurrenceEnd && f.recurrenceEnd < (f.date || dates.today())) throw new Error('recurrence_end must not be before date');
+        const v = cleanValues({ date: dates.today(), allDay: false, recurrence: 'none', color: '', ...f });
+        const saved = await ctx.db.put(STORE, v);
+        return 'Added event: ' + describeEvent(saved);
+      },
+    },
+    {
+      name: 'list',
+      description: 'List calendar events (recurring ones expanded per occurrence) between two dates inclusive. Defaults to today through the next 7 days. Returns ids for use with update/delete.',
+      params: {
+        from: { type: 'string', description: 'Start date YYYY-MM-DD (default today)' },
+        to: { type: 'string', description: 'End date YYYY-MM-DD (default from + 7 days)' },
+        search: { type: 'string', description: 'Only events whose title, location or notes contain this text (case-insensitive)' },
+      },
+      write: false,
+      async run(ctx, args) {
+        const a = args || {};
+        const from = argDate(a.from, 'from', dates.today());
+        const to = argDate(a.to, 'to', dates.addDays(from, 7));
+        if (to < from) throw new Error('to must not be before from');
+        if (dates.daysBetween(from, to) > 366) throw new Error('Range too large: at most 366 days');
+        const q = typeof a.search === 'string' ? a.search.trim().toLowerCase() : '';
+        const all = await ctx.db.all(STORE);
+        let occ = expand(all, from, to);
+        if (q) occ = occ.filter((o) => [o.ev.title, o.ev.location, o.ev.notes].some((s) => String(s || '').toLowerCase().includes(q)));
+        if (!occ.length) return `No events ${from} → ${to}${q ? ` matching "${q}"` : ''}.`;
+        const lines = [`${occ.length} event${occ.length === 1 ? '' : 's'} ${from} → ${to}${q ? ` matching "${q}"` : ''} (id · date time · title):`];
+        for (const o of occ.slice(0, 20)) lines.push(describeEvent(o.ev, o.date));
+        if (occ.length > 20) lines.push(`… ${occ.length - 20} more not shown; narrow the date range or use search.`);
+        return lines.join('\n');
+      },
+    },
+    {
+      name: 'update',
+      description: 'Change fields of an existing event by id (from list). Only the fields given are changed; pass an empty string to clear time, end_time, location, notes or recurrence_end. Editing a recurring event changes the whole series.',
+      params: {
+        id: { type: 'string', description: 'Event id' },
+        title: { type: 'string', description: 'New title' },
+        date: { type: 'string', description: 'New date YYYY-MM-DD (for a series: its start date)' },
+        time: { type: 'string', description: 'New start time HH:MM ("" clears → all-day)' },
+        end_time: { type: 'string', description: 'New end time HH:MM ("" clears)' },
+        duration_minutes: { type: 'number', description: 'Sets end_time = time + minutes when end_time is not given' },
+        all_day: { type: 'boolean', description: 'Make it all-day (true) or timed (false)' },
+        location: { type: 'string', description: 'New location' },
+        notes: { type: 'string', description: 'New notes' },
+        color: { type: 'string', description: 'Color tag', enum: ['', 'green', 'yellow', 'red', 'purple'] },
+        recurrence: { type: 'string', description: 'Repeat rule', enum: ['none', 'daily', 'weekly', 'monthly', 'yearly'] },
+        recurrence_end: { type: 'string', description: 'Last repeat date YYYY-MM-DD ("" = open-ended)' },
+      },
+      required: ['id'],
+      write: true,
+      preview: async (a, ctx) => {
+        a = a || {};
+        let ch = [];
+        try { ch = previewChanges(a); } catch { ch = []; }
+        const what = await previewEvent(ctx, a.id);
+        return `Update ${what}${ch.length ? ' → ' + ch.join(', ') : ' (no changes given)'}`;
+      },
+      async run(ctx, args) {
+        const a = args || {};
+        const fresh = await requireEvent(ctx, a.id);
+        if (a.title !== undefined && !String(a.title).trim()) throw new Error('title cannot be empty');
+        const f = argsToFields(a);
+        const merged = { ...norm(fresh), ...f };
+        if (f.allDay === undefined && f.time && merged.allDay) merged.allDay = false; // giving a time to an all-day event makes it timed
+        if (!merged.allDay && f._duration && merged.time && f.endTime === undefined) merged.endTime = addMinutes(merged.time, f._duration);
+        else if (!merged.allDay && f.time && f.endTime === undefined && !f._duration && isHM(fresh.time) && isHM(fresh.endTime)) {
+          // only the start moved: keep the event's length instead of leaving the old end (possibly before the new start)
+          const toMin = (hm) => { const [hh, mm] = hm.split(':').map(Number); return hh * 60 + mm; };
+          const len = ((toMin(fresh.endTime) - toMin(fresh.time)) % 1440 + 1440) % 1440;
+          merged.endTime = len ? addMinutes(merged.time, len) : '';
+        }
+        delete merged._duration;
+        if (merged.recurrence !== 'none' && merged.recurrenceEnd && merged.recurrenceEnd < merged.date) throw new Error('recurrence_end must not be before date');
+        const v = cleanValues(merged);
+        if (!v.title) throw new Error('title cannot be empty');
+        const saved = await ctx.db.put(STORE, { ...fresh, ...v });
+        return 'Updated event: ' + describeEvent(saved);
+      },
+    },
+    {
+      name: 'delete',
+      description: 'Delete an event by id (from list). A recurring event is deleted with all its repeats. Cannot be undone.',
+      params: { id: { type: 'string', description: 'Event id' } },
+      required: ['id'],
+      write: true,
+      preview: async (a, ctx) => `Delete ${await previewEvent(ctx, (a || {}).id, ' and all its repeats')}`,
+      async run(ctx, args) {
+        const rec = await requireEvent(ctx, (args || {}).id);
+        const line = describeEvent(rec);
+        await ctx.db.delete(STORE, rec.id);
+        return 'Deleted event: ' + line;
+      },
+    },
+  ],
 };

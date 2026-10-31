@@ -243,6 +243,38 @@ function overlayRawPoints(chart, raw, yMin0, yMax0, H) {
   } catch (e) { console.warn('weight: raw overlay failed', e); return false; }
 }
 
+// ---------- AI actions: private helpers ----------
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+/** Validate an optional 'YYYY-MM-DD' action arg (default today); weigh-ins can't be in the future. */
+function actionDate(d) {
+  if (d === undefined || d === null || d === '') return dates.today();
+  if (typeof d !== 'string' || !DATE_RE.test(d)) throw new Error(`date must be YYYY-MM-DD, got "${d}"`);
+  if (d > dates.today()) throw new Error(`Can't log a future weigh-in (${d} is after today ${dates.today()})`);
+  return d;
+}
+/** Compact one-line description of an entry for the model, in the user's unit, with id. */
+function entryLine(e, unit) {
+  const parts = [`${e.date}: ${fmtW(e.kg, unit)}`];
+  if (e.bodyFat != null) parts.push(`${fmt.num(e.bodyFat, 1)}% fat`);
+  if (e.note) parts.push(e.note.length > 80 ? e.note.slice(0, 77) + '…' : e.note);
+  return `${parts.join(' · ')} (id ${e.id})`;
+}
+/** How the UI names a weigh-in in confirmation previews: '82.4 kg from Yesterday · 18.0% fat · "after travel"'. */
+function entryLabel(e, unit) {
+  const parts = [`${fmtW(e.kg, unit)} from ${dates.label(e.date)}`];
+  if (e.bodyFat != null) parts.push(`${fmt.num(e.bodyFat, 1)}% fat`);
+  if (e.note) parts.push(`"${e.note.length > 40 ? e.note.slice(0, 37) + '…' : e.note}"`);
+  return parts.join(' · ');
+}
+/** Preview-only lookup: the normalized weigh-in for an id, or null (never throws). */
+async function previewEntry(ctx, id) {
+  try {
+    const key = id == null ? '' : String(id).trim();
+    if (!key || !ctx?.db) return null;
+    return normalize(await ctx.db.get(STORE, key));
+  } catch { return null; }
+}
+
 function changeChip(delta, label, current, goalKg, unit) {
   if (delta == null) return null;
   const dir = towardGoal(delta, current, goalKg);
@@ -422,6 +454,106 @@ export default {
     }
     return lines.filter((l) => l !== null).join('\n');
   },
+
+  actions: [
+    {
+      name: 'log',
+      description: "Log a weigh-in in the user's unit (kg or lb, see settings). Dates are YYYY-MM-DD; omit date for today. One entry per day: logging onto a date that already has a weigh-in updates it. Use this for 'I weigh 82.4' / 'log 180 lb yesterday'.",
+      params: {
+        weight: { type: 'number', description: "Body weight in the user's unit (kg or lb)" },
+        date: { type: 'string', description: 'Date YYYY-MM-DD (default today; cannot be in the future)' },
+        body_fat: { type: 'number', description: 'Optional body fat percentage (1–80)' },
+        note: { type: 'string', description: "Optional short note, e.g. 'after travel'" },
+      },
+      required: ['weight'],
+      write: true,
+      preview: async (args = {}, ctx) => {
+        const extras = `${args.body_fat != null && args.body_fat !== '' ? ` · ${args.body_fat}% fat` : ''}${args.note ? ` · "${args.note}"` : ''}`;
+        try {
+          const unit = ctx ? unitOf(ctx) : '';
+          const date = typeof args.date === 'string' && DATE_RE.test(args.date) ? args.date : args.date ? null : dates.today();
+          const when = date ? dates.label(date) : String(args.date);
+          const weight = `${args.weight}${unit ? ' ' + unit : ''}`;
+          // One entry per day: logging onto a date that already has a weigh-in updates it, so say so.
+          const existing = date && ctx?.db ? (await ctx.db.where(STORE, 'date', date)).map(normalize).filter(Boolean)[0] : null;
+          if (existing) return `Update weigh-in ${when} ${fmtW(existing.kg, unit)} → ${weight}${extras}`;
+          return `Log weight ${weight}${date === dates.today() ? ' today' : ' on ' + when}${extras}`;
+        } catch {
+          return `Log weight ${args.weight}${args.date ? ' on ' + args.date : ' today'}${extras}`;
+        }
+      },
+      async run(ctx, args = {}) {
+        const unit = unitOf(ctx);
+        const w = Number(args.weight);
+        if (!Number.isFinite(w) || w <= 0) throw new Error(`weight must be a positive number in ${unit}`);
+        const kg = toKg(w, unit);
+        if (kg > 700) throw new Error(`weight ${w} ${unit} is not a plausible body weight`);
+        const date = actionDate(args.date);
+        let bodyFat = null;
+        if (args.body_fat !== undefined && args.body_fat !== null && args.body_fat !== '') {
+          const bf = Number(args.body_fat);
+          if (!Number.isFinite(bf) || bf < 1 || bf > 80) throw new Error('body_fat must be a percentage between 1 and 80');
+          bodyFat = round1(bf);
+        }
+        const note = args.note == null ? '' : String(args.note).trim().slice(0, 300);
+        const { rec, merged } = await saveEntry(ctx, { date, kg: round2(kg), bodyFat, note }, null);
+        const saved = normalize(rec) || { ...rec, kg: round2(kg), bodyFat, note };
+        return `${merged ? 'Updated' : 'Logged'} ${fmtW(saved.kg, unit)} on ${saved.date}${saved.bodyFat != null ? ` · ${fmt.num(saved.bodyFat, 1)}% fat` : ''}${saved.note ? ` · ${saved.note}` : ''} (id ${saved.id})`;
+      },
+    },
+    {
+      name: 'list',
+      description: "List recent weigh-ins, newest first, in the user's unit, with ids (use an id with weight_delete). Also returns the latest weight and 7-day average.",
+      params: {
+        limit: { type: 'integer', description: 'How many entries to return (default 10, max 20)' },
+      },
+      write: false,
+      async run(ctx, args = {}) {
+        const unit = unitOf(ctx);
+        let limit = args.limit == null || args.limit === '' ? 10 : Number(args.limit);
+        if (!Number.isFinite(limit) || limit < 1) throw new Error('limit must be a positive whole number');
+        limit = Math.min(20, Math.floor(limit));
+        const entries = await loadAll(ctx);
+        if (!entries.length) return 'No weigh-ins logged yet.';
+        const latest = entries[entries.length - 1];
+        const ma = movingAvg(entries); const avg7 = ma[ma.length - 1];
+        const goal = goalOf(ctx);
+        const head = [
+          `Weight (${unit}): ${entries.length} entries, ${entries[0].date} → ${latest.date}.`,
+          `Latest ${fmtW(latest.kg, unit)} on ${latest.date}; 7-day avg ${fmtW(avg7.avg, unit)} (${avg7.n} day${avg7.n === 1 ? '' : 's'}).`,
+          goal != null ? `Goal ${fmtW(goal, unit)} (${fmtDelta(goal - latest.kg, unit)} to go).` : 'Goal: not set.',
+        ].join(' ');
+        const shown = entries.slice(-limit).reverse();
+        const lines = shown.map((e) => entryLine(e, unit));
+        if (entries.length > shown.length) lines.push(`… ${entries.length - shown.length} older entr${entries.length - shown.length === 1 ? 'y' : 'ies'} not shown.`);
+        return [head, '', ...lines].join('\n').slice(0, 1500);
+      },
+    },
+    {
+      name: 'delete',
+      description: 'Delete one weigh-in by id (get ids from weight_list). Use when the user says an entry was a mistake.',
+      params: {
+        id: { type: 'string', description: 'The weigh-in id, as shown by weight_list' },
+      },
+      required: ['id'],
+      write: true,
+      preview: async (args = {}, ctx) => {
+        const e = await previewEntry(ctx, args.id);
+        if (!e) return `Delete weigh-in ${args.id}`;
+        try { return `Delete weigh-in ${entryLabel(e, unitOf(ctx))}`; } catch { return `Delete weigh-in ${args.id}`; }
+      },
+      async run(ctx, args = {}) {
+        const id = args.id == null ? '' : String(args.id).trim();
+        if (!id) throw new Error('id is required');
+        const rec = await ctx.db.get(STORE, id);
+        if (!rec) throw new Error(`No weigh-in with id ${id}`);
+        const e = normalize(rec);
+        await ctx.db.delete(STORE, id);
+        const unit = unitOf(ctx);
+        return e ? `Deleted weigh-in ${fmtW(e.kg, unit)} from ${e.date} (id ${id})` : `Deleted weigh-in (id ${id})`;
+      },
+    },
+  ],
 
   async settings(ctx) {
     let unit = unitOf(ctx);

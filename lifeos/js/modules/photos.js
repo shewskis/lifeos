@@ -319,6 +319,23 @@ async function editPhoto(ctx, p, { onDeleted, onSaved } = {}) {
   onSaved?.(saved);
 }
 
+// ---------- AI actions (read-only) ----------
+const DATE_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/;
+const ACTION_ROWS = 20;
+
+function actionDate(v, name) {
+  if (v === undefined || v === null || v === '') return null;
+  if (typeof v !== 'string' || !DATE_RE.test(v)) throw new Error(`${name} must be a date in YYYY-MM-DD format`);
+  return v;
+}
+
+/** One compact text line per photo for the model: id, date, time, weight, note. Never includes image data. */
+function photoLine(p, ctx, { noteChars = 120 } = {}) {
+  const w = weightLabel(p.weightKg, ctx);
+  const note = (p.note || '').replace(/\s+/g, ' ').trim();
+  return `${p.id} | ${p.date}${p.time ? ' ' + p.time : ''}${w ? ' | ' + w : ''}${note ? ' | ' + (note.length > noteChars ? note.slice(0, noteChars) + '…' : note) : ''}`;
+}
+
 // ---------- module ----------
 export default {
   id: 'photos',
@@ -531,4 +548,96 @@ export default {
     lines.push('- (Image data is not included here; the AI module attaches selected photos itself.)');
     return lines.join('\n').slice(0, 8000);
   },
+
+  // Read-only: photos must be taken in the UI (camera / gallery), so there are no write actions.
+  actions: [
+    {
+      name: 'list',
+      description: 'List progress photos (newest first) with id, date, time, weight on that day and note. Never returns image data. Use from_date/to_date (YYYY-MM-DD) to narrow; omit both for the most recent photos.',
+      params: {
+        from_date: { type: 'string', description: 'Only photos on or after this date, YYYY-MM-DD' },
+        to_date: { type: 'string', description: 'Only photos on or before this date, YYYY-MM-DD' },
+        with_note_only: { type: 'boolean', description: 'true = only photos that have a note' },
+        limit: { type: 'integer', description: 'Max rows to return (1-20, default 20)' },
+      },
+      write: false,
+      async run(ctx, args = {}) {
+        const from = actionDate(args.from_date, 'from_date');
+        const to = actionDate(args.to_date, 'to_date');
+        if (from && to && from > to) throw new Error('from_date must not be after to_date');
+        let limit = args.limit === undefined || args.limit === null ? ACTION_ROWS : Number(args.limit);
+        if (!Number.isInteger(limit) || limit < 1) throw new Error('limit must be a whole number from 1 to ' + ACTION_ROWS);
+        limit = Math.min(limit, ACTION_ROWS);
+        const photos = await loadAll(ctx);
+        if (!photos.length) return 'No progress photos yet. Photos are taken in the app (Body > Progress photos).';
+        let rows = photos;
+        if (from) rows = rows.filter((p) => p.date >= from);
+        if (to) rows = rows.filter((p) => p.date <= to);
+        if (args.with_note_only) rows = rows.filter((p) => (p.note || '').trim());
+        if (!rows.length) return `No photos match${from ? ' from ' + from : ''}${to ? ' to ' + to : ''}${args.with_note_only ? ' with a note' : ''} (${photos.length} photos total).`;
+        const shown = [...rows].reverse().slice(0, limit);
+        const lines = [`${rows.length} photo${rows.length === 1 ? '' : 's'}${from || to ? ' in range' : ''} (${photos.length} total). Format: id | date time | weight | note`];
+        for (const p of shown) lines.push(photoLine(p, ctx));
+        if (rows.length > shown.length) lines.push(`… ${rows.length - shown.length} older not shown; narrow with from_date/to_date.`);
+        return lines.join('\n').slice(0, 1500);
+      },
+    },
+    {
+      name: 'get',
+      description: 'Get one progress photo by id: date, time, weight on that day and the full note. Never returns image data.',
+      params: {
+        id: { type: 'string', description: 'Photo id (from photos_list)' },
+      },
+      required: ['id'],
+      write: false,
+      async run(ctx, args = {}) {
+        const id = typeof args.id === 'string' ? args.id.trim() : '';
+        if (!id) throw new Error('id is required');
+        const photos = await loadAll(ctx);
+        const i = photos.findIndex((p) => p.id === id);
+        if (i < 0) throw new Error(`No photo with id ${id}`);
+        const p = photos[i];
+        const w = weightLabel(p.weightKg, ctx);
+        const sameDay = photos.filter((x) => x.date === p.date).length;
+        const lines = [
+          `Photo ${p.id} — ${p.date}${p.time ? ' ' + p.time : ''} (${dates.label(p.date)}${dates.daysBetween(p.date, dates.today()) > 1 ? ', ' + dates.ago(p.date) : ''}), #${i + 1} of ${photos.length}${sameDay > 1 ? ', ' + sameDay + ' photos that day' : ''}.`,
+          `Weight that day: ${w || 'not logged'}.`,
+          `Note: ${(p.note || '').trim() ? String(p.note).trim().slice(0, 600) : '(none)'}`,
+        ];
+        return lines.join('\n').slice(0, 1500);
+      },
+    },
+    {
+      name: 'summary',
+      description: 'Summary of the progress-photo habit: total photos, days covered, current streak, adherence since a date, first/latest photo (with ids) and weight change between them. Read-only.',
+      params: {
+        since: { type: 'string', description: 'Start of the adherence window, YYYY-MM-DD (default: 30 days ago)' },
+      },
+      write: false,
+      async run(ctx, args = {}) {
+        const today = dates.today();
+        const since = actionDate(args.since, 'since') || dates.addDays(today, -30);
+        if (since > today) throw new Error('since must not be in the future');
+        const photos = await loadAll(ctx);
+        if (!photos.length) return 'No progress photos yet. Photos are taken in the app (Body > Progress photos).';
+        const first = photos[0], latest = photos[photos.length - 1];
+        const inRange = photos.filter((p) => p.date >= since);
+        const periodDays = dates.daysBetween(since, today) + 1;
+        const daysWith = distinctDays(inRange);
+        const streak = streakDays(photos);
+        const lines = [
+          `Total: ${photos.length} photos on ${distinctDays(photos)} days. Current streak: ${streak} day${streak === 1 ? '' : 's'}. Today's photo: ${photos.some((p) => p.date === today) ? 'done' : 'not yet'}.`,
+          `Since ${since}: ${inRange.length} photos on ${daysWith}/${periodDays} days (${Math.round((daysWith / periodDays) * 100)}% adherence).`,
+          `First: ${photoLine(first, ctx, { noteChars: 60 })}`,
+          `Latest: ${photoLine(latest, ctx, { noteChars: 60 })} (${dates.ago(latest.date)})`,
+        ];
+        const withW = photos.filter((p) => p.weightKg != null);
+        if (withW.length >= 2) {
+          const a = withW[0], b = withW[withW.length - 1];
+          lines.push(`Weight on photo days: ${weightLabel(a.weightKg, ctx)} (${a.date}) → ${weightLabel(b.weightKg, ctx)} (${b.date}), ${weightDiffLabel(a.weightKg, b.weightKg, ctx)} over ${dates.daysBetween(a.date, b.date)} days.`);
+        }
+        return lines.join('\n').slice(0, 1500);
+      },
+    },
+  ],
 };

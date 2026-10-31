@@ -13,22 +13,34 @@ const MODELS = [
 ];
 const EFFORTS = ['low', 'medium', 'high'];
 const DAYS = [30, 90, 365];
+// Chips: plain strings are sent as-is; { prefill } puts a starter into the input so the user finishes the sentence.
 const SUGGESTIONS = [
-  'Daily brief', 'Weekly review', 'Patterns in my dreams', 'Where is my money going?',
-  'Plan my week', 'Am I on track with my goals?', 'Fitness & weight trend',
+  'Daily brief', { label: 'Add a task…', prefill: 'Add a task: ' }, { label: 'Log weight…', prefill: 'Log my weight: ' },
+  { label: 'Add an event…', prefill: 'Add to my calendar: ' }, 'Plan my week', 'Weekly review', 'Where is my money going?',
+  'Am I on track with my goals?', 'Patterns in my dreams', 'Fitness & weight trend',
 ];
 const PHYSIQUE_CHIP = 'Physique feedback';
 const SDK_URL = 'https://esm.sh/@anthropic-ai/sdk';
+const MAX_TOOL_ROUNDS = 6;
+const MAX_TOKENS = 32000; // thinking and text share this cap; streaming is already in use, so a large value is safe
+/** Writes that cannot be undone are confirmed even when "apply without asking" is on. Modules may set `destructive: true`. */
+const isDestructive = (p) => p.entry.action.destructive === true || /^(delete|clear_day)$/.test(p.entry.action.name);
 
-const SYSTEM = [
-  "You are the user's personal life coach inside their private LifeOS app.",
-  'You have their full self-tracked data (weight, progress photos, dreams, notes, tasks, goals, habits, calendar, money) in <life_report>.',
+const SYSTEM_BASE = [
+  "You are the user's personal life coach and assistant inside their private LifeOS app.",
+  'You have their full self-tracked data (weight, progress photos, dreams, notes, tasks, goals, habits, calendar, money, ideas) in <life_report>.',
   'Be concrete and specific — quote their actual numbers, dates and entries. Find patterns across domains (sleep/dreams vs mood, spending vs mood, habits vs weight).',
   'Give 2-4 prioritized, actionable suggestions, not generic advice. Be warm but direct.',
   'Use short headers and bullets. Keep it under ~300 words unless the user asks for a detailed review.',
   'For physique photos give honest, encouraging feedback about visible changes and training focus — never medical diagnoses.',
+  'You can also change their data with the tools: add, complete, update or delete tasks, events, habits, weights, notes, dreams, goals, money entries and ideas.',
+  'When the user asks you to do something, do it with tools instead of describing how. Use a read tool first when you need an id or are unsure which record they mean; the life report only shows summaries.',
+  'Resolve relative dates ("tomorrow", "next Friday", "7pm") yourself from today\'s date in the report. After acting, reply with a one-line summary of what changed; do not repeat the tool output.',
   "Today's date is given in the report. Finish with at most one question.",
 ].join(' ');
+const CONFIRM_ON = 'Write tools are shown to the user for approval in the app before they run, so do not ask for permission in text — just call the tool. If a request is genuinely ambiguous (which task? which day?), ask one short question instead.';
+const CONFIRM_OFF = 'Adds and edits run immediately without confirmation, so be careful: only change what was clearly asked for, and when a request is ambiguous (which task? which day?) ask one short question instead of guessing. Deletes are still shown to the user for approval.';
+const systemFor = (autoApply) => `${SYSTEM_BASE} ${autoApply ? CONFIRM_OFF : CONFIRM_ON}`;
 
 // ---------- settings ----------
 function cfg(settings) {
@@ -41,7 +53,75 @@ function cfg(settings) {
     days: DAYS.includes(days) ? days : 90,
     effort: EFFORTS.includes(effort) ? effort : 'medium',
     includePhotos: !!settings.get('ai:includePhotos', false),
+    autoApply: !!settings.get('ai:autoApply', false),
   };
+}
+
+// ---------- actions → tools ----------
+/** Every module's `actions` become Claude tools named '<moduleId>_<action>'. Returns { tools, byName }. */
+function buildTools(ctx) {
+  const tools = [], byName = new Map();
+  for (const m of ctx.modules || []) {
+    for (const a of m.actions || []) {
+      if (!a?.name || typeof a.run !== 'function') continue;
+      const name = `${m.id}_${a.name}`.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
+      if (byName.has(name)) { console.warn('duplicate action', name); continue; }
+      byName.set(name, { module: m, action: a });
+      tools.push({ name, description: String(a.description || `${a.name} in ${m.title}`), input_schema: { type: 'object', properties: a.params || {}, required: Array.isArray(a.required) ? a.required : [] } });
+    }
+  }
+  return { tools, byName };
+}
+/** Human line for a write action. preview(args, ctx) may be async (e.g. look up a record's title by id). */
+async function previewOf(ctx, entry, args) {
+  const oneLine = (s) => String(s).replace(/\s+/g, ' ').trim();
+  try { const p = await entry.action.preview?.(args, ctx); if (p) return oneLine(p); } catch (e) { console.warn('preview failed', entry.module.id, entry.action.name, e); }
+  const vals = Object.entries(args || {}).map(([k, v]) => `${k}: ${typeof v === 'string' ? v : JSON.stringify(v)}`).join(', ');
+  return oneLine(`${entry.module.title}: ${entry.action.name.replace(/_/g, ' ')}${vals ? ' — ' + vals : ''}`);
+}
+/** Change log ('actions' record, one preview per line) → plain-text list. Not markdown: previews quote user titles that may contain _ * ` or #. */
+const logEl = (text) => h('ul.ai-log', String(text ?? '').split('\n').filter(Boolean).map((l) => h('li', l)));
+async function runAction(ctx, entry, args) {
+  const out = await entry.action.run(ctx, args || {});
+  const text = out == null ? 'Done' : typeof out === 'string' ? out : JSON.stringify(out);
+  return text.length > 4000 ? text.slice(0, 4000) + '…' : text;
+}
+
+/**
+ * Confirmation card for write actions. Resolves with a Set of the tool_use ids the user approved (empty = skipped all),
+ * or null when the request was stopped. The card is replaced by the caller once the results are in.
+ */
+function confirmActions(chat, items, signal) {
+  return new Promise((resolve) => {
+    const boxes = new Map();
+    const anyDanger = items.some((it) => it.destructive);
+    const applyLabel = h('span', 'Apply');
+    const applyBtn = h('button.btn.primary.grow', { type: 'button', onclick: () => finish(new Set(items.filter((it) => boxes.get(it.id).checked).map((it) => it.id))) }, icon('check', 18), applyLabel);
+    if (anyDanger) applyBtn.classList.add('danger');
+    const relabel = () => {
+      const n = items.filter((it) => boxes.get(it.id).checked).length;
+      applyBtn.disabled = n === 0;
+      applyLabel.textContent = n === items.length ? (anyDanger ? 'Apply (includes delete)' : 'Apply') : `Apply ${n} of ${items.length}`;
+    };
+    const rows = items.map((it) => {
+      const cb = h('input', { type: 'checkbox', onchange: relabel }); cb.checked = true; boxes.set(it.id, cb);
+      return h('label.ai-action-row', { class: it.destructive ? 'danger' : '' }, cb,
+        h('span.grow', it.preview, it.destructive ? h('span.small.muted', ' · permanent') : null));
+    });
+    relabel();
+    let done = false;
+    const finish = (val) => { if (done) return; done = true; signal?.removeEventListener('abort', onAbort); card.remove(); resolve(val); };
+    const onAbort = () => finish(null);
+    signal?.addEventListener('abort', onAbort);
+    const card = h('div.msg.ai.ai-confirm',
+      h('div.ai-confirm-title', icon('edit', 18), items.length === 1 ? 'The assistant wants to make this change' : `The assistant wants to make ${items.length} changes`),
+      h('div.stack', rows),
+      h('div.row', { style: { gap: '8px', marginTop: '10px' } },
+        applyBtn,
+        h('button.btn.grow', { type: 'button', onclick: () => finish(new Set()) }, 'Skip')));
+    chat.append(card);
+    scrollBottom({ force: true, smooth: false }); // jump, don't animate content under a finger
+  });
 }
 const modelShort = (id) => MODELS.find((m) => m.value === id)?.short || id;
 
@@ -75,6 +155,7 @@ function md(src) {
 // ---------- helpers ----------
 let sdkPromise = null;
 function loadSDK() {
+  if (window.__ANTHROPIC_SDK_OVERRIDE) return Promise.resolve(window.__ANTHROPIC_SDK_OVERRIDE); // test hook: a fake client class
   if (!sdkPromise) {
     sdkPromise = import(/* webpackIgnore: true */ SDK_URL).then((m) => m.default || m.Anthropic).catch((e) => { sdkPromise = null; throw Object.assign(new Error('Could not load the AI library (needs internet)'), { isImportError: true, cause: e }); });
   }
@@ -144,16 +225,21 @@ function describeError(e) {
 }
 const isAbort = (e) => e && (e.name === 'AbortError' || e.name === 'APIUserAbortError' || /abort/i.test(e.message || ''));
 
-let scrollRaf = 0;
-/** Scroll to the bottom at most once per frame. Without force, only when the user is already near the bottom. */
+let scrollRaf = 0, scrollForce = false, scrollSmooth = true;
+/** Scroll to the bottom at most once per frame; coalesced calls keep the strongest flags (any force wins, any non-smooth wins).
+ *  Without force, only when the user is already near the bottom. */
 function scrollBottom({ force = false, smooth = true } = {}) {
+  scrollForce = scrollForce || force;
+  scrollSmooth = scrollSmooth && smooth;
   if (scrollRaf) return;
   scrollRaf = requestAnimationFrame(() => {
     scrollRaf = 0;
+    const doForce = scrollForce, doSmooth = scrollSmooth;
+    scrollForce = false; scrollSmooth = true;
     const el = document.documentElement;
     const gap = el.scrollHeight - window.scrollY - window.innerHeight;
-    if (!force && gap > 160) return;
-    window.scrollTo({ top: el.scrollHeight, behavior: smooth ? 'smooth' : 'auto' });
+    if (!doForce && gap > 160) return;
+    window.scrollTo({ top: el.scrollHeight, behavior: doSmooth ? 'smooth' : 'auto' });
   });
 }
 
@@ -172,6 +258,14 @@ function moduleStyle() {
     .ai-keyrow .icon-btn{width:48px;height:48px;border-radius:12px;background:var(--card-2);border:1px solid var(--border)}
     .ai-setup li{margin-bottom:4px}
     .ai-setup ul{padding-left:20px;margin:0 0 8px}
+    .ai-confirm{align-self:stretch;max-width:100%;border-color:color-mix(in srgb,var(--accent) 45%,var(--border))}
+    .ai-confirm-title{display:flex;align-items:center;gap:8px;font-weight:700;margin-bottom:8px;color:var(--accent)}
+    .ai-action-row{display:flex;align-items:flex-start;gap:10px;min-height:44px;padding:10px 0;border-top:1px solid var(--border);font-size:14px;line-height:1.4;cursor:pointer}
+    .ai-action-row input{width:24px;height:24px;margin:-2px 0 0;accent-color:var(--accent);flex:0 0 auto}
+    .ai-action-row.danger .grow{color:var(--bad)}
+    .ai-action-row.danger input{accent-color:var(--bad)}
+    .ai-actions{align-self:stretch;max-width:100%;background:var(--card-2);font-size:13px}
+    .ai-actions .ai-log{margin:0;padding-left:18px;display:grid;gap:4px}
     @media (min-width:720px){.ai-dock{max-width:640px;margin:0 auto}}
   `);
 }
@@ -192,7 +286,7 @@ function renderSetup(container, ctx, params) {
   container.append(
     card(
       h('div.row', { style: { marginBottom: '8px' } }, h('span.accent', icon('ai', 28)), h('h3', { style: { margin: 0 } }, 'Your personal life coach')),
-      h('p.muted', 'The coach reads your weight, photos, dreams, notes, tasks, goals, habits, calendar and money — then gives concrete, personal suggestions. Ask for a daily brief, a weekly review, or where your money is going.'),
+      h('p.muted', 'The coach reads your weight, photos, dreams, notes, tasks, goals, habits, calendar, money and ideas — then gives concrete, personal suggestions. It can also make changes for you: "add a task for tomorrow", "log 82.4 kg", "park the podcast idea". Every change is shown for your OK first.'),
       h('div.ai-setup',
         h('h4', { style: { marginTop: '12px' } }, 'Privacy'),
         h('ul.small.muted',
@@ -252,7 +346,13 @@ async function renderChat(container, ctx, state, params, alive = () => true) {
   const stopBtn = h('button.btn.sm.danger', { style: { display: 'none', minHeight: '46px' }, onclick: () => { state.ctl?.abort(); state.stream?.abort?.(); } }, 'Stop');
   const chips = h('div.suggestions');
   const chipList = hasPhotos ? [...SUGGESTIONS, PHYSIQUE_CHIP] : SUGGESTIONS;
-  for (const label of chipList) chips.append(h('button.chip.accent', { type: 'button', onclick: () => send(label, { physique: label === PHYSIQUE_CHIP }) }, label));
+  for (const s of chipList) {
+    const label = typeof s === 'string' ? s : s.label;
+    const onclick = typeof s === 'string'
+      ? () => send(label, { physique: label === PHYSIQUE_CHIP })
+      : () => { if (state.busy) return; ta.value = s.prefill; autoGrow(); ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); };
+    chips.append(h('button.chip.accent', { type: 'button', onclick }, label));
+  }
   const dock = h('div.ai-dock', chips, h('div.chat-input-bar', ta, stopBtn, sendBtn));
   container.append(dock);
   const fitDock = () => { container.style.paddingBottom = (dock.offsetHeight + 8) + 'px'; };
@@ -274,12 +374,15 @@ async function renderChat(container, ctx, state, params, alive = () => true) {
   // history
   const bubble = (m) => m.role === 'user'
     ? h('div.msg.user', String(m.text ?? ''))
-    : h('div.msg.ai', { html: md(String(m.text ?? '')) });
+    : m.kind === 'actions'
+      ? h('div.msg.ai.ai-actions', logEl(m.text))
+      : h('div.msg.ai', { html: md(String(m.text ?? '')) });
   const draw = async () => {
     if (state.busy) return; // live bubbles are on screen; redraw when the reply is saved
-    clear(chat);
     let rows = [];
     try { rows = await ctx.db.all(STORE, { index: 'ts' }); } catch (e) { console.error(e); }
+    if (state.busy) return; // a send() started during the read owns the chat now; its finally will redraw
+    clear(chat); // clear only after the read, so the chat is never emptied while a send can slip in
     rows = rows.filter((r) => r && r.text != null).slice(-50);
     if (!rows.length) {
       chat.append(empty('Ask your coach anything', 'Tap a suggestion below or type a question. It reads everything you log in LifeOS and answers with your real numbers.', 'ai'));
@@ -312,9 +415,19 @@ async function renderChat(container, ctx, state, params, alive = () => true) {
     chat.append(userBubble, aiBubble);
     scrollBottom({ force: true });
 
-    let acc = '';
+    let acc = '';   // text streamed in the current round
+    let base = '';  // text of the finished rounds (hoisted so the abort path can save it too)
     let aborted = false;
     let notice = null; // error / refusal notice; re-appended after draw() clears the chat
+    // Human lines about what was done. Persisted after every round (same record re-put), so changes that already ran
+    // leave a trace even if the follow-up request fails or the user presses Stop.
+    const log = [];
+    let logRec = null;
+    const saveLog = async () => {
+      if (!log.length) return;
+      try { logRec = await ctx.db.put(STORE, { ...(logRec || { date: dates.today(), role: 'assistant', kind: 'actions', ts: Date.now() }), text: log.join('\n') }); }
+      catch (e) { console.warn('could not save the change log', e); }
+    };
     state.stream = null;
     // Stop works before the SDK stream exists too: the controller covers the report build, SDK import and photo encoding.
     const ctl = new AbortController();
@@ -337,54 +450,137 @@ async function renderChat(container, ctx, state, params, alive = () => true) {
       if (!messages) throw new Error('Could not build the conversation');
 
       const client = new Anthropic({ apiKey: current.apiKey, dangerouslyAllowBrowser: true });
+      const { tools, byName } = buildTools(ctx);
+      const system = systemFor(current.autoApply);
+      // Text from every round streams into one bubble.
       const attach = (stream) => {
         state.stream = stream;
-        stream.on('text', (delta) => { acc += delta; aiBubble.classList.remove('typing'); aiBubble.innerHTML = md(acc); scrollBottom({ smooth: false }); });
+        stream.on('text', (delta) => { acc += delta; aiBubble.classList.remove('typing'); aiBubble.style.display = ''; aiBubble.innerHTML = md(base + acc); scrollBottom({ smooth: false }); });
       };
       const reqOpts = { signal: ctl.signal };
-      const start = (beta) => beta
-        ? client.beta.messages.stream({ model: current.model, max_tokens: 4096, betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default', output_config: { effort: current.effort }, system: SYSTEM, messages }, reqOpts)
-        : client.messages.stream({ model: current.model, max_tokens: 4096, system: SYSTEM, messages }, reqOpts);
+      // After a mid-output server-side fallback, the blocks before the last `fallback` marker are a discarded partial:
+      // keep its text, drop its thinking/tool_use (they are neither run nor echoed). The non-beta endpoint has no
+      // `fallback` block type, so the markers are stripped when the beta path is abandoned.
+      const echoable = (content) => { const i = content.map((b) => b.type).lastIndexOf('fallback'); return i < 0 ? content : content.filter((b, k) => k > i || b.type === 'text' || b.type === 'fallback'); };
+      const stripFallback = (msgs) => msgs.map((m) => (Array.isArray(m.content) ? { ...m, content: m.content.filter((b) => b.type !== 'fallback') } : m));
+      const start = (beta, msgs) => beta
+        ? client.beta.messages.stream({ model: current.model, max_tokens: MAX_TOKENS, betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default', output_config: { effort: current.effort }, system, tools, messages: msgs }, reqOpts)
+        : client.messages.stream({ model: current.model, max_tokens: MAX_TOKENS, output_config: { effort: current.effort }, system, tools, messages: stripFallback(msgs) }, reqOpts);
+      let useBeta = true;
+      const ask = async (msgs) => {
+        acc = '';
+        attach(start(useBeta, msgs));
+        try {
+          return await state.stream.finalMessage();
+        } catch (e) {
+          if (e?.status === 400 && useBeta && !isAbort(e)) {
+            useBeta = false; acc = ''; aiBubble.classList.add('typing'); aiBubble.innerHTML = md(base);
+            attach(start(false, msgs));
+            return await state.stream.finalMessage();
+          }
+          throw e;
+        }
+      };
 
-      let final;
-      attach(start(true));
-      try {
-        final = await state.stream.finalMessage();
-      } catch (e) {
-        if (e?.status === 400 && !isAbort(e)) {
-          acc = ''; aiBubble.classList.add('typing'); aiBubble.innerHTML = '';
-          attach(start(false));
-          final = await state.stream.finalMessage();
-        } else throw e;
+      // ---- tool loop: the model may call module actions; writes are confirmed by the user first ----
+      let convo = messages;
+      let final = await ask(convo);
+      for (let round = 0; round < MAX_TOOL_ROUNDS && final?.stop_reason === 'tool_use'; round++) {
+        const kept = echoable(final.content || []);
+        const uses = kept.filter((b) => b.type === 'tool_use');
+        if (!uses.length) break;
+        base += acc + (acc.trim() ? '\n\n' : '');
+        acc = ''; // folded into base — otherwise an abort before the next ask() would save this round twice
+        aiBubble.innerHTML = md(base);
+        const planned = uses.map((u) => ({ id: u.id, name: u.name, input: u.input || {}, entry: byName.get(u.name), preview: '' }));
+        const writes = planned.filter((p) => p.entry?.action.write);
+        for (const p of writes) { p.preview = await previewOf(ctx, p.entry, p.input); checkAbort(); }
+        // "Apply without asking" skips the card for adds and edits only; anything irreversible is always confirmed.
+        const toConfirm = current.autoApply ? writes.filter(isDestructive) : writes;
+        const approved = new Set(writes.filter((p) => !toConfirm.includes(p)).map((p) => p.id));
+        if (toConfirm.length) {
+          // Waiting on the user, not the model: no blinking dots above the card, and Stop reads as Cancel.
+          aiBubble.classList.remove('typing');
+          if (!base.trim()) aiBubble.style.display = 'none';
+          stopBtn.textContent = 'Cancel';
+          let picked = null;
+          try { picked = await confirmActions(chat, toConfirm.map((p) => ({ id: p.id, preview: p.preview, destructive: isDestructive(p) })), ctl.signal); }
+          finally { stopBtn.textContent = 'Stop'; aiBubble.style.display = ''; }
+          checkAbort();
+          for (const id of picked || []) approved.add(id);
+        }
+        const results = [];
+        for (const p of planned) {
+          checkAbort();
+          let content, isError = false;
+          if (!p.entry) { content = `Unknown tool ${p.name}`; isError = true; }
+          else if (p.entry.action.write && !approved.has(p.id)) { content = 'The user declined this change. Do not retry it; ask if they want something else.'; log.push('✗ Skipped: ' + p.preview); }
+          else {
+            try { content = await runAction(ctx, p.entry, p.input); if (p.entry.action.write) log.push('✓ ' + p.preview); }
+            catch (e) { console.error('action failed', p.name, e); content = `Error: ${e?.message || e}`; isError = true; if (p.entry.action.write) log.push('⚠ Failed: ' + p.preview + ' — ' + (e?.message || e)); }
+          }
+          results.push({ type: 'tool_result', tool_use_id: p.id, content, is_error: isError || undefined });
+        }
+        if (log.length) {
+          const seen = aiBubble.previousElementSibling?.classList?.contains('ai-actions-live') ? aiBubble.previousElementSibling : null;
+          const liveLog = seen || h('div.msg.ai.ai-actions.ai-actions-live');
+          liveLog.replaceChildren(logEl(log.join('\n')));
+          if (!seen) chat.insertBefore(liveLog, aiBubble);
+          await saveLog();
+        }
+        aiBubble.classList.add('typing');
+        convo = [...convo, { role: 'assistant', content: kept }, { role: 'user', content: results }];
+        final = await ask(convo);
       }
 
-      const answer = (final?.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('') || acc;
+      // Round cap hit while the model still wanted tools: those calls were never run — say so instead of saving
+      // "Adding those now…" as if it happened.
+      const leftover = final?.stop_reason === 'tool_use' ? echoable(final.content || []).filter((b) => b.type === 'tool_use') : [];
+      if (leftover.length) log.push(`⚠ Stopped after ${MAX_TOOL_ROUNDS} rounds of changes; ${leftover.length} proposed call${leftover.length === 1 ? '' : 's'} not applied. Ask again to continue.`);
+      const refused = final?.stop_reason === 'refusal';      // mid-stream refusal: the API says to discard the partial
+      const truncated = final?.stop_reason === 'max_tokens'; // thinking + text hit the cap; any tool_use in it is incomplete and was not run
+      const roundText = refused ? '' : ((final?.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('') || acc);
+      const answer = (base + roundText).trim();
       aiBubble.classList.remove('typing');
+      aiBubble.style.display = '';
       aiBubble.innerHTML = md(answer);
-      if (final?.stop_reason === 'refusal') { notice = h('div.small.muted.ai-notice', { style: { textAlign: 'center' } }, 'The model declined to answer this one.'); chat.append(notice); }
-      if (answer.trim()) await ctx.db.put(STORE, { date: dates.today(), role: 'assistant', text: answer, ts: Date.now() });
-      else if (final?.stop_reason !== 'refusal') aiBubble.remove();
+      if (refused) { notice = h('div.small.muted.ai-notice', { style: { textAlign: 'center' } }, 'The model declined to answer this one.'); chat.append(notice); }
+      else if (truncated) {
+        const dropped = (final.content || []).some((b) => b.type === 'tool_use');
+        notice = h('div.small.muted.ai-notice', { style: { textAlign: 'center' } }, dropped
+          ? 'The answer was cut off before the assistant could finish its changes — nothing from that step was applied. Try again or lower the effort in Settings.'
+          : 'The answer was cut off (too long). Try again or lower the effort in Settings.');
+        chat.append(notice);
+      }
+      await saveLog();
+      if (answer) await ctx.db.put(STORE, { date: dates.today(), role: 'assistant', text: truncated ? answer + '\n\n_(cut off)_' : answer, ts: Date.now() });
+      else if (!refused && !truncated) aiBubble.remove();
     } catch (e) {
       aborted = isAbort(e);
       aiBubble.classList.remove('typing');
+      aiBubble.style.display = '';
+      await saveLog(); // changes that already ran must leave a trace even when the next round was stopped or failed
       if (aborted) {
-        if (acc.trim()) { aiBubble.innerHTML = md(acc); try { await ctx.db.put(STORE, { date: dates.today(), role: 'assistant', text: acc, ts: Date.now() }); } catch {} }
+        const partial = (base + acc).trim();
+        if (partial) { aiBubble.innerHTML = md(partial); try { await ctx.db.put(STORE, { date: dates.today(), role: 'assistant', text: partial, ts: Date.now() }); } catch {} }
         else aiBubble.remove();
-        toast('Stopped');
+        if (alive()) toast('Stopped'); // the screen may have been torn down (navigation / remount): nothing to announce there
       } else {
         console.error(e);
         aiBubble.remove();
         const msg = describeError(e);
         notice = h('div.notice.ai-notice', { style: { alignSelf: 'stretch' } }, msg, (e?.status === 401 || e?.status === 403) ? h('button.btn.sm', { style: { marginLeft: '8px' }, onclick: () => ctx.nav('settings') }, 'Open Settings') : null);
-        chat.append(notice);
-        toast(msg);
+        if (alive()) { chat.append(notice); toast(msg); }
       }
     } finally {
       state.stream = null;
       state.ctl = null;
+      stopBtn.textContent = 'Stop';
       setBusy(false);
-      await draw(); // clears the chat and redraws DB rows…
-      if (notice) { chat.append(notice); scrollBottom({ force: true }); } // …so put the notice back afterwards
+      if (alive()) {
+        await draw(); // clears the chat and redraws DB rows…
+        if (notice) { chat.append(notice); scrollBottom({ force: true }); } // …so put the notice back afterwards
+      }
     }
   }
 
@@ -396,11 +592,11 @@ async function renderChat(container, ctx, state, params, alive = () => true) {
 export default {
   id: 'ai',
   title: 'AI Coach',
-  subtitle: 'Reads everything, gives tips',
+  subtitle: 'Reads everything, gives tips, makes changes',
   icon: 'ai',
   tab: null,
   stores: { [STORE]: { indexes: ['date', 'ts'] } },
-  quickActions: [],
+  quickActions: [], // the Today screen already has the AI Coach card; a 9th quick tile would break the 4-column grid
   todayCard: null,
 
   async render(container, ctx) {
@@ -472,6 +668,13 @@ export default {
     tog.checked = c.includePhotos;
     tog.addEventListener('change', () => { ctx.settings.set('ai:includePhotos', tog.checked); toast(tog.checked ? 'Photos included in every question' : 'Photos only when you ask for physique feedback'); });
     wrap.append(h('label.field.toggle-row', h('span.field-label', 'Include progress photos (3 per question)'), h('span.switch', tog, h('span.knob'))));
+
+    // apply changes without confirmation
+    const auto = h('input', { type: 'checkbox' });
+    auto.checked = c.autoApply;
+    auto.addEventListener('change', () => { ctx.settings.set('ai:autoApply', auto.checked); toast(auto.checked ? 'Changes apply immediately' : 'Changes wait for your OK'); });
+    wrap.append(h('label.field.toggle-row', h('span.field-label', 'Apply changes without asking'), h('span.switch', auto, h('span.knob'))),
+      h('span.hint', 'Off: every add, edit or delete the assistant proposes is listed for your OK first. On: adds and edits happen immediately (a log stays in the chat); deletes still ask, because they cannot be undone.'));
 
     // clear chat
     wrap.append(h('button.btn.block', { onclick: async () => { if (!(await confirm('Delete the whole conversation with your coach?', { okLabel: 'Clear history' }))) return; await ctx.db.clear(STORE); toast('Chat history cleared'); } }, icon('trash', 18), 'Clear chat history'));

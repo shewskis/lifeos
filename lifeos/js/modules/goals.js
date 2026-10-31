@@ -444,6 +444,77 @@ function emptyFor(ctx, filter, total) {
   return empty('No completed goals yet', 'Mark a goal done and it lands here.', 'check');
 }
 
+// ---------- AI assistant actions (private helpers) ----------
+const LIST_FILTERS = ['active', 'paused', 'done', 'all'];
+const catValues = CATEGORIES.map((c) => c.value);
+const aiCap = (s, n = 1500) => (s.length > n ? s.slice(0, n - 1) + '…' : s);
+/** '' for empty, else a validated 'YYYY-MM-DD' string; throws a plain message otherwise. */
+function aiDate(v, field) {
+  if (v == null || v === '') return '';
+  const s = String(v).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || dates.key(dates.parse(s)) !== s) throw new Error(`${field} must be a real date in YYYY-MM-DD format`);
+  return s;
+}
+/** null for empty, else a finite number; throws a plain message otherwise. */
+function aiNumber(v, field) {
+  if (v == null || v === '') return null;
+  const n = Number(String(v).trim().replace(',', '.'));
+  if (!Number.isFinite(n)) throw new Error(`${field} must be a number`);
+  return n;
+}
+/** Load + normalise one goal by id, or throw. */
+async function aiGoal(ctx, id) {
+  const key = String(id ?? '').trim();
+  if (!key) throw new Error('goal_id is required (use goals_list to find it)');
+  const raw = await ctx.db.get(STORE, key);
+  if (!raw) throw new Error(`No goal with id ${key} (use goals_list to find ids)`);
+  return norm(raw);
+}
+/** Find a milestone by id, exact title or unique title fragment, or throw. */
+function aiMilestone(g, ref) {
+  const key = String(ref ?? '').trim();
+  const byId = g.milestones.find((m) => m.id === key);
+  if (byId) return byId;
+  const q = key.toLowerCase();
+  const exact = g.milestones.filter((m) => m.title.toLowerCase() === q);
+  const found = exact.length ? exact : g.milestones.filter((m) => m.title.toLowerCase().includes(q));
+  if (!found.length) throw new Error(`No milestone matching "${key}" on goal "${trunc(g.title, 40)}" — use goals_list with detail=true for milestone ids`);
+  if (found.length > 1) throw new Error(`"${key}" matches ${found.length} milestones (${found.slice(0, 5).map((m) => `${m.id} "${trunc(m.title, 30)}"`).join(', ')}) — give the milestone id`);
+  return found[0];
+}
+function aiLine(g, tasks) {
+  const dl = deadline(g);
+  const parts = [`${g.id} · "${trunc(g.title, 60)}" [${g.category}] ${g.status} · ${pctOf(g)}%`, dl.text + (g.targetDate ? ` (${g.targetDate})` : '')];
+  if (g.metric) parts.push(`${g.metric.name} ${metricText(g.metric)}`);
+  if (g.milestones.length) parts.push(`milestones ${milestonesDone(g)}/${g.milestones.length}`);
+  const open = openTasksFor(tasks || [], g.id).length;
+  if (open) parts.push(`${open} open task${open === 1 ? '' : 's'}`);
+  if (isStale(g)) parts.push(`STALE ${daysSinceProgress(g)}d`);
+  return parts.join(' · ');
+}
+function aiDetail(g, tasks) {
+  const L = [aiLine(g, tasks)];
+  if (g.why) L.push(`  why: ${trunc(g.why, 200)}`);
+  if (g.completedAt) L.push(`  completed ${tsKey(g.completedAt)}`);
+  if (g.milestones.length) {
+    L.push('  milestones:');
+    for (const m of g.milestones.slice(0, 20)) L.push(`   ${m.done ? '[x]' : '[ ]'} ${m.id} "${trunc(m.title, 60)}"${m.done && m.doneAt ? ' done ' + tsKey(m.doneAt) : ''}`);
+    if (g.milestones.length > 20) L.push(`   … ${g.milestones.length - 20} more milestones`);
+  }
+  return L.join('\n');
+}
+/** Preview-only helpers: never throw, so a confirmation card always renders. */
+async function aiPeek(ctx, id) {
+  try { const raw = await ctx?.db?.get(STORE, String(id ?? '').trim()); return raw ? norm(raw) : null; } catch { return null; }
+}
+function aiDateLabel(d) {
+  const s = String(d ?? '').trim();
+  if (!s) return '';
+  try { return /^\d{4}-\d{2}-\d{2}$/.test(s) && dates.key(dates.parse(s)) === s ? dates.label(s) : s; } catch { return s; }
+}
+const aiName = (g) => `"${trunc(g.title, 50)}"`;
+const aiDue = (g) => (g.targetDate ? ` (due ${aiDateLabel(g.targetDate)})` : '');
+
 export default {
   id: 'goals',
   title: 'Goals',
@@ -551,4 +622,174 @@ export default {
     if (text.length > 7500) text = text.slice(0, 7490) + '\n…';
     return text;
   },
+
+  actions: [
+    {
+      name: 'add',
+      description: 'Create a new goal. Give metric_name + metric_target to track a number (e.g. "Weight" → 75 kg); otherwise progress comes from ticking milestones. Dates are YYYY-MM-DD; omit target_date for no deadline.',
+      params: {
+        title: { type: 'string', description: 'Short goal title, e.g. "Run a 10k"' },
+        why: { type: 'string', description: 'Why it matters to the user (optional)' },
+        category: { type: 'string', enum: catValues, description: 'Life area; default other' },
+        target_date: { type: 'string', description: 'Deadline YYYY-MM-DD (optional)' },
+        metric_name: { type: 'string', description: 'Name of the number to track, e.g. "Weight", "Saved", "Books read" (optional; needs metric_target)' },
+        metric_start: { type: 'number', description: 'Starting value of the metric (default 0)' },
+        metric_target: { type: 'number', description: 'Target value of the metric (required when metric_name is set)' },
+        metric_unit: { type: 'string', description: 'Unit of the metric, e.g. kg, EUR, km, books (optional)' },
+        milestones: { type: 'string', description: 'Initial milestones separated by ";" (optional)' },
+      },
+      required: ['title'],
+      write: true,
+      preview: (a = {}) => `Add goal "${a.title}"${a.target_date ? ' due ' + aiDateLabel(a.target_date) : ''}${a.metric_name ? ` tracking ${a.metric_name} → ${a.metric_target}${a.metric_unit ? ' ' + a.metric_unit : ''}` : ''}`,
+      async run(ctx, a = {}) {
+        const title = String(a.title ?? '').trim();
+        if (!title) throw new Error('title is required');
+        if (a.category != null && a.category !== '' && !catValues.includes(a.category)) throw new Error(`category must be one of: ${catValues.join(', ')}`);
+        const r = fromFormValues({
+          title, why: a.why, category: a.category || 'other', targetDate: aiDate(a.target_date, 'target_date'),
+          metricName: a.metric_name, metricStart: aiNumber(a.metric_start, 'metric_start'), metricTarget: aiNumber(a.metric_target, 'metric_target'), metricUnit: a.metric_unit,
+        }, null);
+        if (r.error) throw new Error(r.error);
+        const milestones = (Array.isArray(a.milestones) ? a.milestones : String(a.milestones ?? '').split(';')).map((s) => String(s ?? '').trim()).filter(Boolean).map((t) => ({ id: uid(), title: t, done: false, doneAt: null }));
+        const saved = norm(await ctx.db.put(STORE, { ...r.data, status: 'active', milestones, completedAt: null, lastProgressAt: Date.now() }));
+        return `Added goal ${saved.id} "${trunc(saved.title, 60)}" [${saved.category}]${saved.targetDate ? ' due ' + saved.targetDate : ''}${saved.metric ? ` · ${saved.metric.name} ${metricText(saved.metric)}` : ''}${milestones.length ? ` · ${milestones.length} milestone${milestones.length === 1 ? '' : 's'}` : ''}`;
+      },
+    },
+    {
+      name: 'list',
+      description: 'List goals with ids, progress %, deadline, metric and milestone counts. Pass goal_id (or detail=true) to also get the why text and each milestone with its id, needed for goals_update_progress.',
+      params: {
+        status: { type: 'string', enum: LIST_FILTERS, description: 'Filter by status; default active' },
+        query: { type: 'string', description: 'Only goals whose title or why contains this text (optional)' },
+        goal_id: { type: 'string', description: 'Show one goal in full detail (optional)' },
+        detail: { type: 'boolean', description: 'Include why text and milestones with ids (fewer goals shown)' },
+      },
+      write: false,
+      async run(ctx, a = {}) {
+        const tasks = await loadTasks(ctx.db);
+        if (a.goal_id) return aiCap(aiDetail(await aiGoal(ctx, a.goal_id), tasks));
+        const status = a.status || 'active';
+        if (!LIST_FILTERS.includes(status)) throw new Error(`status must be one of: ${LIST_FILTERS.join(', ')}`);
+        let all = (await ctx.db.all(STORE)).map(norm);
+        const q = String(a.query ?? '').trim().toLowerCase();
+        if (q) all = all.filter((g) => g.title.toLowerCase().includes(q) || g.why.toLowerCase().includes(q));
+        const rows = status === 'all'
+          ? ['active', 'paused', 'done'].flatMap((st) => sortGoals(all.filter((g) => g.status === st), st))
+          : sortGoals(all.filter((g) => g.status === status), status);
+        if (!rows.length) return `No ${status === 'all' ? '' : status + ' '}goals${q ? ` matching "${q}"` : ''}.`;
+        const max = a.detail ? 8 : 20;
+        const L = [`${rows.length} ${status === 'all' ? '' : status + ' '}goal${rows.length === 1 ? '' : 's'}${q ? ` matching "${q}"` : ''} (id · title [category] status · progress):`];
+        // Add rows while they fit the ~1,500-char budget so the "… N more" note (and every shown id) survives the cap.
+        let len = L[0].length, shown = 0;
+        for (const g of rows) {
+          if (shown >= max) break;
+          const row = a.detail ? aiDetail(g, tasks) : aiLine(g, tasks);
+          if (shown && len + row.length + 1 > 1380) break;
+          L.push(row); len += row.length + 1; shown++;
+        }
+        if (rows.length > shown) L.push(`… ${rows.length - shown} more not shown — narrow with status or query.`);
+        return aiCap(L.join('\n'));
+      },
+    },
+    {
+      name: 'update_progress',
+      description: 'Move a goal forward: set the metric current value, tick (or untick) a milestone, and/or add a new milestone. Milestone ids come from goals_list with detail=true; a unique title fragment also works.',
+      params: {
+        goal_id: { type: 'string', description: 'Goal id from goals_list' },
+        metric_current: { type: 'number', description: 'New current value of the goal metric (only for goals with a metric)' },
+        milestone: { type: 'string', description: 'Milestone id or (part of) its title to tick' },
+        milestone_done: { type: 'boolean', description: 'true (default) marks that milestone done; false reopens it' },
+        add_milestone: { type: 'string', description: 'Title of a new milestone to add' },
+      },
+      required: ['goal_id'],
+      write: true,
+      preview: async (a = {}, ctx) => {
+        const g = await aiPeek(ctx, a.goal_id);
+        const p = [];
+        if (a.metric_current != null && a.metric_current !== '') {
+          const m = g?.metric;
+          p.push(m ? `set ${m.name} to ${a.metric_current}${m.unit ? ' ' + m.unit : ''} (was ${fmt.num(m.current, 2)}, target ${fmt.num(m.target, 2)})` : `set current value to ${a.metric_current}`);
+        }
+        if (a.milestone) {
+          let title = String(a.milestone);
+          if (g) { try { title = aiMilestone(g, a.milestone).title; } catch {} }
+          p.push(`${a.milestone_done === false ? 'reopen' : 'tick'} milestone "${trunc(title, 40)}"`);
+        }
+        if (a.add_milestone) p.push(`add milestone "${trunc(a.add_milestone, 40)}"`);
+        const what = p.join(', ') || 'no change';
+        return g ? `Update goal ${aiName(g)}: ${what}` : `Update goal ${a.goal_id}: ${what}`;
+      },
+      async run(ctx, a = {}) {
+        let g = await aiGoal(ctx, a.goal_id);
+        const mc = aiNumber(a.metric_current, 'metric_current');
+        const msRef = String(a.milestone ?? '').trim();
+        const addTitle = String(a.add_milestone ?? '').trim();
+        if (mc == null && !msRef && !addTitle) throw new Error('Give at least one of metric_current, milestone or add_milestone');
+        const did = [];
+        if (mc != null) {
+          if (!g.metric) throw new Error(`Goal "${trunc(g.title, 40)}" has no metric — tick milestones instead`);
+          g = norm(await mutateGoal(ctx, g, (cur) => (cur.metric ? { metric: { ...cur.metric, current: mc } } : null)));
+          did.push(`${g.metric.name} now ${metricText(g.metric)}`);
+        }
+        if (msRef) {
+          const m = aiMilestone(g, msRef);
+          const want = a.milestone_done !== false;
+          if (m.done === want) did.push(`milestone "${trunc(m.title, 40)}" was already ${want ? 'done' : 'open'}`);
+          else { await toggleMilestone(ctx, g, m.id); g = await aiGoal(ctx, g.id); did.push(`${want ? 'ticked' : 'reopened'} milestone ${m.id} "${trunc(m.title, 40)}"`); }
+        }
+        if (addTitle) {
+          if (!(await addMilestone(ctx, g, addTitle))) throw new Error('add_milestone title is empty');
+          g = await aiGoal(ctx, g.id);
+          const m = g.milestones[g.milestones.length - 1];
+          did.push(`added milestone ${m.id} "${trunc(m.title, 40)}"`);
+        }
+        const pct = pctOf(g);
+        return `Goal ${g.id} "${trunc(g.title, 50)}": ${did.join('; ')} · now ${pct}%${g.milestones.length ? ` · milestones ${milestonesDone(g)}/${g.milestones.length}` : ''}${pct >= 100 && g.status === 'active' ? ' · target reached — ask the user whether to mark it done (goals_set_status)' : ''}`;
+      },
+    },
+    {
+      name: 'set_status',
+      description: 'Change a goal status: done (complete it), paused, or active (resume a paused goal / reopen a done one).',
+      params: {
+        goal_id: { type: 'string', description: 'Goal id from goals_list' },
+        status: { type: 'string', enum: STATUSES.map((s) => s.value), description: 'New status' },
+      },
+      required: ['goal_id', 'status'],
+      write: true,
+      preview: async (a = {}, ctx) => {
+        const g = await aiPeek(ctx, a.goal_id);
+        if (!g) return `${a.status === 'done' ? 'Mark done' : a.status === 'paused' ? 'Pause' : 'Set active'} goal ${a.goal_id}`;
+        const verb = a.status === 'done' ? 'Mark done' : a.status === 'paused' ? 'Pause' : g.status === 'done' ? 'Reopen' : g.status === 'paused' ? 'Resume' : 'Set active';
+        return `${verb} goal ${aiName(g)}${aiDue(g)} · ${pctOf(g)}%, currently ${g.status}`;
+      },
+      async run(ctx, a = {}) {
+        if (!STATUSES.some((s) => s.value === a.status)) throw new Error(`status must be one of: ${STATUSES.map((s) => s.value).join(', ')}`);
+        const g = await aiGoal(ctx, a.goal_id);
+        if (g.status === a.status) return `Goal ${g.id} "${trunc(g.title, 50)}" is already ${a.status}.`;
+        if (a.status === 'done') await markDone(ctx, g);
+        else await saveGoal(ctx, g, { status: a.status, completedAt: null });
+        return `Goal ${g.id} "${trunc(g.title, 50)}" is now ${a.status}${a.status === 'done' ? ` (completed ${dates.today()})` : ''}.`;
+      },
+    },
+    {
+      name: 'delete',
+      description: 'Permanently delete a goal and its milestones (linked tasks stay in Tasks). Prefer goals_set_status done or paused unless the user explicitly wants it removed.',
+      params: {
+        goal_id: { type: 'string', description: 'Goal id from goals_list' },
+      },
+      required: ['goal_id'],
+      write: true,
+      preview: async (a = {}, ctx) => {
+        const g = await aiPeek(ctx, a.goal_id);
+        if (!g) return `Delete goal ${a.goal_id} and its milestones`;
+        const n = g.milestones.length;
+        return `Delete goal ${aiName(g)}${aiDue(g)}${n ? ` and its ${n} milestone${n === 1 ? '' : 's'}` : ''} — linked tasks stay in Tasks`;
+      },
+      async run(ctx, a = {}) {
+        const g = await aiGoal(ctx, a.goal_id);
+        await ctx.db.delete(STORE, g.id);
+        return `Deleted goal ${g.id} "${trunc(g.title, 60)}" (${g.milestones.length} milestone${g.milestones.length === 1 ? '' : 's'}). Linked tasks were kept.`;
+      },
+    },
+  ],
 };
