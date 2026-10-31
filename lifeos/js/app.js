@@ -37,6 +37,7 @@ const app = {
     // plain history navigation handled by hashchange. A sentinel left over from a reload would only cost a dead press.
     if (history.state?.sheet) { try { history.replaceState(null, '', location.href); } catch {} }
     this.onHash();
+    this._started = true;
     registerSW();
     showInstallHintOnce();
   },
@@ -354,5 +355,50 @@ function maybeShowInstallHint() {
   toast('Install LifeOS on your home screen', { ms: 8000, action: 'Install', onAction: installApp });
 }
 
+// ---------- startup safety net ----------
+// Nothing is drawn until the database opens, so a stalled start would be a blank page with no way out. Show what is
+// going on and offer a repair that resets the service worker and caches (never the data in IndexedDB).
+function showStartupHelp(kind, err) {
+  const view = document.getElementById('view');
+  if (!view || view.querySelector('.startup-help')) return;
+  const state = app.db.state || 'opening';
+  // Any stall before the database is open has the same usual cause: another LifeOS window or tab (often one Android
+  // froze in the background) still holds the old database, so an update that adds to it cannot run. The database
+  // reports 'blocked' when it can see that; right after a reload it may still read 'opening' while the previous
+  // page's request lingers, so the message does not depend on it.
+  const why = kind === 'error'
+    ? String(err?.message || err)
+    : 'LifeOS is waiting for its database. Usually another LifeOS window or browser tab is still open (possibly frozen in the background) and is holding the old database, so an update that adds to it cannot finish.';
+  const steps = h('ol.install-steps',
+    h('li', 'Close every other LifeOS window and every browser tab showing it (check Chrome’s tab list). This screen continues by itself the moment they are gone.'),
+    h('li', 'If nothing happens, tap Reload. If the screen stays blank, tap Repair app: it refreshes the app files and keeps all your data.'));
+  const box = h('div.card.startup-help',
+    h('h3', kind === 'error' ? 'LifeOS could not start' : 'Waiting to finish the update'),
+    h('p.small.muted', why),
+    steps,
+    h('div.row', { style: { gap: '8px', marginTop: '12px' } },
+      h('button.btn.primary.grow', { onclick: () => location.reload() }, icon('refresh', 18), 'Reload'),
+      h('button.btn.grow', { onclick: repairApp }, 'Repair app')),
+    h('p.small.muted.mt', `Version ${window.LIFEOS_VERSION || '?'} · database ${state}`));
+  view.append(box);
+}
+async function repairApp() {
+  try {
+    if ('serviceWorker' in navigator) for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+    if ('caches' in window) for (const k of await caches.keys()) await caches.delete(k);
+  } catch (e) { console.warn('repair', e); }
+  location.replace(location.pathname + '?r=' + Date.now() + '#/today');
+}
+
 window.lifeos = app;
-app.init().catch((e) => { console.error(e); document.getElementById('view').append(ui.empty('Failed to start', String(e?.message || e))); });
+app._startupHelp = showStartupHelp; // reachable from devtools for checking the screen
+// A blocked database upgrade is shown as soon as it is detected (nothing will move until the user acts); any other
+// stall shows the card after 3 s. A normal start takes well under a second.
+const startedAt = Date.now();
+const startupWatchdog = setInterval(() => {
+  if (app._started) { clearInterval(startupWatchdog); return; }
+  if (app.db.state === 'blocked' || Date.now() - startedAt > 3000) showStartupHelp('slow');
+}, 500);
+app.init()
+  .then(() => { clearInterval(startupWatchdog); document.querySelector('.startup-help')?.remove(); })
+  .catch((e) => { console.error(e); clearInterval(startupWatchdog); showStartupHelp('error', e); });

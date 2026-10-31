@@ -23,16 +23,31 @@ export class DB {
 
   async open() {
     // Open at current version, then bump the version if any registered store is missing.
+    this.state = 'opening';
     let db = await this._open();
     const missing = Object.keys(this.schema).filter((s) => !db.objectStoreNames.contains(s));
     const missingIdx = this._missingIndexes(db);
     if (missing.length || missingIdx) {
       const v = db.version + 1;
       db.close();
+      // If another LifeOS window still holds the old database open, this request waits (state 'blocked') until that
+      // window closes its connection; IndexedDB queues any further open() behind it, so there is no way around it from
+      // here. app.js watches `state` and tells the user what to do.
+      this.state = 'upgrading';
       db = await this._open(v);
     }
     this.db = db;
+    this.state = 'open';
     this.db.onversionchange = () => { this.db.close(); location.reload(); };
+    // A background page that Android has frozen cannot run its versionchange handler, so its open connection would
+    // block the next update forever. Release the connection before the page is frozen or parked in the back/forward
+    // cache, and start fresh when it comes back.
+    const release = () => { if (this.state === 'open') { this.state = 'released'; try { this.db.close(); } catch {} } };
+    const revive = () => { if (this.state === 'released') location.reload(); };
+    document.addEventListener('freeze', release);
+    document.addEventListener('resume', revive);
+    window.addEventListener('pagehide', (e) => { if (e.persisted) release(); });
+    window.addEventListener('pageshow', (e) => { if (e.persisted) revive(); });
     return this;
   }
 
@@ -49,6 +64,7 @@ export class DB {
   _open(version) {
     return new Promise((resolve, reject) => {
       const req = version ? indexedDB.open(DB_NAME, version) : indexedDB.open(DB_NAME);
+      req.onblocked = () => { console.warn('IndexedDB open blocked — close other tabs of this app'); this.state = 'blocked'; };
       req.onupgradeneeded = (e) => {
         const db = req.result;
         for (const [name, def] of Object.entries(this.schema)) {
@@ -60,7 +76,6 @@ export class DB {
       };
       req.onsuccess = () => resolve(req.result);
       req.onerror = () => reject(req.error);
-      req.onblocked = () => console.warn('IndexedDB open blocked — close other tabs of this app');
     });
   }
 
